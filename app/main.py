@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app import jobs
-from app.config import settings
+from app.config import BASE_DIR, settings
 from app.routes import router
 
 logger = logging.getLogger("video_to_image")
@@ -52,7 +52,9 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    app.mount("/static", StaticFiles(directory="static"), name="static")
+    app.mount(
+        "/static", StaticFiles(directory=BASE_DIR / "static"), name="static"
+    )
     app.include_router(router)
 
     @app.exception_handler(HTTPException)

@@ -8,9 +8,10 @@ short content hash means a changed file is always a new URL.
 from __future__ import annotations
 
 import hashlib
-from pathlib import Path
 
-STATIC_DIR = Path("static")
+from app.config import BASE_DIR
+
+STATIC_DIR = BASE_DIR / "static"
 
 # relative path -> (mtime, version); recomputed whenever the file changes, so
 # editing during development is picked up without a restart.

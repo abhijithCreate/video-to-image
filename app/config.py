@@ -7,6 +7,13 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Templates and static files ship alongside the code, so they are located
+# relative to this package - never to the working directory. A serverless host
+# imports the app with its own cwd (Vercel uses /var/task), and a cwd-relative
+# "static" made StaticFiles raise at import time, killing the whole function
+# before any error handler existed.
+BASE_DIR = Path(__file__).resolve().parents[1]
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")

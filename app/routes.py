@@ -13,7 +13,12 @@ from starlette.concurrency import run_in_threadpool
 
 from app import jobs
 from app.assets import asset_url
-from app.config import ALLOWED_VIDEO_EXTENSIONS, QUALITY_PRESETS, settings
+from app.config import (
+    ALLOWED_VIDEO_EXTENSIONS,
+    BASE_DIR,
+    QUALITY_PRESETS,
+    settings,
+)
 from app.services import download as download_service
 from app.services import image as image_service
 from app.services import media_site as media_site_service
@@ -21,7 +26,7 @@ from app.services import video as video_service
 from app.services import zip as zip_service
 
 router = APIRouter()
-templates = Jinja2Templates(directory="templates")
+templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
 CHUNK_SIZE = 1024 * 1024
 
