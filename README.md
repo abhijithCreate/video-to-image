@@ -56,8 +56,8 @@ brew install ffmpeg           # or: apt-get install ffmpeg
 uvicorn app.main:app --reload
 ```
 
-Run from the project root: templates and static files are resolved relative to
-the working directory.
+Templates and static files are located relative to the `app` package, not the
+working directory, so it does not matter where you start the server from.
 
 ## Tests
 
@@ -66,7 +66,24 @@ pytest
 ```
 
 Tests that need a real video are skipped automatically when FFmpeg is not on
-`PATH`; `GET /health` reports whether the server can see it.
+`PATH`; `GET /health` reports whether the server can see it. To run *everything*
+without installing FFmpeg locally, use the image, which bundles it:
+
+```bash
+docker run --rm -v "$PWD":/work -w /work -e HOME=/tmp \
+  video-to-image:latest python -m pytest -q -p no:cacheprovider
+```
+
+One test actually reaches YouTube and is opt-in, so the suite stays deterministic
+and does not fail when a video is taken down:
+
+```bash
+V2I_NETWORK_TESTS=1 pytest tests/test_media_site.py
+```
+
+`tests/conftest.py` chdirs to the project root, which is convenient but hides a
+whole class of path bug — see [Vercel](#vercel). `tests/test_deployment.py`
+deliberately runs from elsewhere to cover it.
 
 ## Configuration
 
@@ -154,11 +171,13 @@ app/
 ├── config.py        environment-backed settings
 ├── routes.py        HTTP layer: validation and orchestration only
 ├── jobs.py          temp job directories, metadata, cleanup, path safety
+├── assets.py        content-hashed URLs for static files
 └── services/
-    ├── video.py     ffprobe metadata, extraction plans, FFmpeg frame decoding
-    ├── image.py     Pillow: format, quality, resize, compression
-    ├── download.py  fetching a video from a URL, with SSRF protection
-    └── zip.py       archive creation
+    ├── video.py      ffprobe metadata, extraction plans, FFmpeg frame decoding
+    ├── image.py      Pillow: format, quality, resize, compression, output naming
+    ├── download.py   fetching a video from a URL, with SSRF protection
+    ├── media_site.py resolving a video-site page (YouTube etc.) with yt-dlp
+    └── zip.py        archive creation
 ```
 
 Processing is confined to `app/services`. Routes never shell out and never touch
@@ -318,21 +337,54 @@ before that. `docker compose up --build` serves port 8000.
 ### Vercel
 
 `vercel.json` deploys `app/main.py` as a Python serverless function with
-conservative limits (20 MB upload, 20 s duration, 100 images). Serverless caveats to know before
-relying on it:
+conservative limits (20 MB upload, 20 s duration, 100 images).
 
-- **The Vercel Python runtime does not include FFmpeg.** Uploads will be rejected
-  with a clear message until you make an `ffmpeg`/`ffprobe` binary available and
-  point `FFMPEG_PATH` / `FFPROBE_PATH` at it.
-- Instances are ephemeral: a job may be processed on one instance and downloaded
-  from another, which loses the result. Long clips also risk the invocation
-  timeout.
-- Video-site links are a poor fit for serverless: extraction plus download eats
-  the invocation budget, and the platform's IPs are the ones sites block hardest.
-  Consider `ALLOW_MEDIA_SITE_URLS=false` there.
+**It will serve the page, but it cannot convert video.** The Vercel Python
+runtime ships no FFmpeg, so every upload is refused with *"Video processing is
+unavailable on this server (FFmpeg not found)."* — a clean 400, and `/health`
+reports `"ffmpeg": false`. Treat a Vercel deploy as a demo of the UI unless you
+supply an `ffmpeg`/`ffprobe` binary in the bundle and point `FFMPEG_PATH` /
+`FFPROBE_PATH` at it. A static ffmpeg build is ~80 MB on its own, which runs
+straight into the bundle limit below.
 
-For anything beyond light use, deploy the Docker image to a host with a
-persistent filesystem (Fly.io, Railway, Render, a VPS). The API and UI are
+#### Paths must not depend on the working directory
+
+A serverless host imports the module with a working directory of its own —
+Vercel uses `/var/task`. `StaticFiles(directory="static")` resolves that against
+the cwd and **raises at import time**, so `app = create_app()` never completes:
+
+```text
+RuntimeError: Directory 'static' does not exist
+    → 500 FUNCTION_INVOCATION_FAILED
+```
+
+The failure arrives before any exception handler exists, which is why the host
+shows its own generic crash page rather than this app's JSON error. Everything
+bundled is therefore located from `BASE_DIR` in `app/config.py`
+(`Path(__file__).resolve().parents[1]`), never from the cwd. `Jinja2Templates`
+had the same bug with a nastier signature: it accepts a missing directory
+happily and only fails later, at render.
+
+Keep `BASE_DIR` in mind when adding anything that opens a bundled file — and
+note that `tests/conftest.py` chdirs to the project root, so the ordinary suite
+cannot catch a regression here. `tests/test_deployment.py` runs from a foreign
+directory on purpose.
+
+#### Other serverless caveats
+
+- **The bundle is larger than `maxLambdaSize` claims.** The dependencies install
+  to ~79 MB — `yt-dlp` alone is 24 MB, Pillow 11 MB — against the 35 MB in
+  `vercel.json`. `requirements.txt` also still carries `pytest` and `httpx`,
+  which no production deploy needs.
+- **Instances are ephemeral.** A job may be processed on one instance and
+  downloaded from another, which loses the result. Long clips also risk the
+  invocation timeout.
+- **Video-site links are a poor fit.** Extraction plus download eats the
+  invocation budget, and a platform's IPs are the ones sites challenge hardest.
+  Set `ALLOW_MEDIA_SITE_URLS=false` there.
+
+For anything beyond a UI demo, deploy the Docker image to a host with a real
+filesystem and FFmpeg (Fly.io, Railway, Render, a VPS). The API and UI are
 unchanged either way.
 
 ## Image viewing
@@ -368,7 +420,8 @@ arrows in favour of swipe.
 
 ## Static assets
 
-`style.css` and `app.js` are referenced through `asset()`, which stamps each URL
+`style.css`, `app.js` and the vendored Lightbox3 files are referenced through
+`asset()`, which stamps each URL
 with a short hash of the file's contents (`/static/js/app.js?v=f3ba7abdff`). A
 deploy therefore cannot be driven by a script the browser cached earlier — the
 symptom of which is new HTML behaving like the old build (for example steps not
