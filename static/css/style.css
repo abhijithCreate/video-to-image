@@ -1,0 +1,143 @@
+/* Small layer of component classes on top of Tailwind, kept intentionally short. */
+
+.field {
+  width: 100%;
+  border-radius: 0.5rem;
+  border: 1px solid rgb(203 213 225);
+  background-color: #fff;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.875rem;
+  color: inherit;
+}
+.field:focus {
+  outline: 2px solid #3861f6;
+  outline-offset: 1px;
+  border-color: #3861f6;
+}
+.dark .field {
+  border-color: rgb(51 65 85);
+  background-color: rgb(15 23 42);
+}
+
+.field-label {
+  display: block;
+  margin-bottom: 0.375rem;
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+.field-hint {
+  margin-top: 0.375rem;
+  font-size: 0.75rem;
+  color: rgb(100 116 139);
+}
+.dark .field-hint { color: rgb(148 163 184); }
+
+/* Selectable tiles for the extraction-method radio group. */
+.option-tile {
+  display: flex;
+  gap: 0.625rem;
+  align-items: flex-start;
+  border: 1px solid rgb(226 232 240);
+  border-radius: 0.75rem;
+  padding: 0.75rem;
+  font-size: 0.875rem;
+  cursor: pointer;
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+.option-tile:hover { border-color: rgb(148 163 184); }
+.dark .option-tile { border-color: rgb(30 41 59); }
+.dark .option-tile:hover { border-color: rgb(71 85 105); }
+
+.option-tile:has(.option-radio:checked) {
+  border-color: #3861f6;
+  background-color: rgb(238 244 255);
+}
+.dark .option-tile:has(.option-radio:checked) {
+  background-color: rgba(56, 97, 246, 0.12);
+}
+.option-tile:has(.option-radio:focus-visible) {
+  outline: 2px solid #3861f6;
+  outline-offset: 2px;
+}
+
+.option-radio {
+  margin-top: 0.2rem;
+  height: 1rem;
+  width: 1rem;
+  accent-color: #3861f6;
+  flex: none;
+}
+
+/* Lightbox: native <dialog> so ESC, focus trapping and inertness come free. */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Step navigation ---------------------------------------------------------- */
+
+/* Only the current step is shown, so this is orientation rather than a nav. */
+.step-counter {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgb(100 116 139);
+}
+.dark .step-counter { color: rgb(148 163 184); }
+
+.back-arrow {
+  display: grid;
+  place-items: center;
+  height: 2.25rem;
+  width: 2.25rem;
+  flex: none;
+  border-radius: 0.625rem;
+  border: 1px solid rgb(226 232 240);
+  background-color: #fff;
+  color: rgb(71 85 105);
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+.back-arrow:hover {
+  background-color: rgb(241 245 249);
+  border-color: rgb(148 163 184);
+  color: rgb(15 23 42);
+}
+.back-arrow:focus-visible { outline: 2px solid #3861f6; outline-offset: 2px; }
+.dark .back-arrow {
+  border-color: rgb(30 41 59);
+  background-color: rgb(15 23 42);
+  color: rgb(203 213 225);
+}
+.dark .back-arrow:hover {
+  background-color: rgb(30 41 59);
+  border-color: rgb(71 85 105);
+  color: #fff;
+}
+
+/* Lightbox3 injects captions as HTML but ships no anchor styles, so the
+   per-frame download link would render as plain text. The library's chrome bar
+   is pointer-events:none with the caption re-enabling it, so the link is
+   clickable - it just needs to look it. */
+.lightbox3-caption a {
+  color: #fff;
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  white-space: nowrap;
+}
+.lightbox3-caption a:hover { color: rgb(147 197 253); }
+.lightbox3-caption a:focus-visible {
+  border-radius: 2px;
+  outline: 2px solid rgba(255, 255, 255, 0.8);
+  outline-offset: 2px;
+}

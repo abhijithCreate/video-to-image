@@ -1,0 +1,31 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "builds": [
+    {
+      "src": "app/main.py",
+      "use": "@vercel/python",
+      "config": {
+        "maxLambdaSize": "35mb",
+        "includeFiles": [
+          "templates/**",
+          "static/**"
+        ]
+      }
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "app/main.py"
+    }
+  ],
+  "env": {
+    "APP_ENV": "production",
+    "MAX_UPLOAD_SIZE_MB": "20",
+    "MAX_VIDEO_DURATION_SECONDS": "20",
+    "MAX_OUTPUT_IMAGES": "100",
+    "JOB_RETENTION_MINUTES": "60",
+    "TEMP_DIR": "/tmp/video-to-image",
+    "MAX_DOWNLOAD_CLIENTS": "3"
+  }
+}

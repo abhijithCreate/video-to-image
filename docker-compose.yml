@@ -1,0 +1,22 @@
+services:
+  web:
+    build: .
+    image: video-to-image
+    ports:
+      - "8000:8000"
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-50}
+      MAX_VIDEO_DURATION_SECONDS: ${MAX_VIDEO_DURATION_SECONDS:-60}
+      MAX_OUTPUT_IMAGES: ${MAX_OUTPUT_IMAGES:-500}
+      JOB_RETENTION_MINUTES: ${JOB_RETENTION_MINUTES:-60}
+      MAX_DOWNLOAD_CLIENTS: ${MAX_DOWNLOAD_CLIENTS:-3}
+      TEMP_DIR: /tmp/video-to-image
+      MAX_TOTAL_OUTPUT_MB: ${MAX_TOTAL_OUTPUT_MB:-2048}
+      ALLOW_URL_UPLOADS: ${ALLOW_URL_UPLOADS:-true}
+      ALLOW_PRIVATE_URL_HOSTS: ${ALLOW_PRIVATE_URL_HOSTS:-false}
+    # Jobs live on the container's own ephemeral layer rather than a tmpfs: a
+    # 500-image batch can be several GB, which is too much to hold in RAM.
+    # Nothing is persisted - the directory dies with the container, and the
+    # retention sweep clears jobs long before that.
+    restart: unless-stopped

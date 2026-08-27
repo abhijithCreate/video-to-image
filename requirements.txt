@@ -1,0 +1,14 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+jinja2==3.1.5
+python-multipart==0.0.20
+pydantic==2.10.5
+pydantic-settings==2.7.1
+pillow==11.1.0
+# Resolves video-site pages (YouTube and similar) to a downloadable stream.
+# Extractors break when sites change, so this needs bumping periodically.
+yt-dlp==2026.8.19
+
+# development / tests
+pytest==8.3.4
+httpx==0.28.1
