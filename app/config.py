@@ -5,6 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Templates and static files ship alongside the code, so they are located
@@ -16,7 +17,34 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # The env file is anchored like everything else: a cwd-relative ".env" is
+    # silently ignored when the server is started from another directory, which
+    # is worse than a crash - the app runs happily on defaults instead.
+    model_config = SettingsConfigDict(env_file=BASE_DIR / ".env", extra="ignore")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _blank_means_unset(cls, values: object) -> object:
+        """Treat an empty environment variable as absent.
+
+        Hosting dashboards let a variable be declared with no value, and it
+        arrives as "". Pydantic will not coerce "" to an int or a bool, so a
+        handful of blank rows in a Vercel project killed the whole function at
+        import with nine validation errors - before any error handler existed to
+        report them. A blank value means "not configured", so drop it and let
+        the default below stand.
+
+        This also makes the documented "leave empty to resolve from PATH" true
+        for FFMPEG_PATH / FFPROBE_PATH: blank now yields the default rather than
+        an empty string no lookup could resolve.
+        """
+        if isinstance(values, dict):
+            return {
+                key: value
+                for key, value in values.items()
+                if not (isinstance(value, str) and not value.strip())
+            }
+        return values
 
     app_env: str = "development"
 

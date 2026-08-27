@@ -87,7 +87,19 @@ deliberately runs from elsewhere to cover it.
 
 ## Configuration
 
-All settings come from the environment (see `.env.example`). Never commit `.env`.
+All settings come from the environment. `.env` is **optional** — every value
+below has a working default, so the app runs without one:
+
+```bash
+cp .env.example .env
+```
+
+`.env` is read from the project root regardless of where you start the server
+(see [Paths must not depend on the working directory](#paths-must-not-depend-on-the-working-directory));
+a cwd-relative env file is silently ignored from another directory, which leaves
+the app running on defaults with nothing to say the config was skipped. `.env` is
+gitignored and must stay that way — `.env.example` is the file that gets
+committed.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -369,6 +381,34 @@ Keep `BASE_DIR` in mind when adding anything that opens a bundled file — and
 note that `tests/conftest.py` chdirs to the project root, so the ordinary suite
 cannot catch a regression here. `tests/test_deployment.py` runs from a foreign
 directory on purpose.
+
+#### A blank environment variable is not the same as an unset one
+
+A hosting dashboard will happily store a variable with **no value**, and it
+reaches the process as `""`. Pydantic will not coerce `""` into an `int` or a
+`bool`, so a handful of blank rows in a Vercel project produced this at import:
+
+```text
+ValidationError: 9 validation errors for Settings
+  max_total_output_mb
+    Input should be a valid integer ... [input_value='', input_type=str]
+  allow_url_uploads
+    Input should be a valid boolean ... [input_value='', input_type=str]
+  ...
+    → 500 FUNCTION_INVOCATION_FAILED
+```
+
+The nine were exactly the keys present in `.env.example` but absent from
+`vercel.json`'s `env` block, minus the four whose type accepts a blank string —
+the signature of copying the example's key list into a dashboard without
+filling in values. `THUMBNAIL_SIZE`, an `int` that is *not* in `.env.example`,
+was conspicuously fine.
+
+`Settings` now drops blank values before validation (`_blank_means_unset`), so a
+blank variable means "not configured" and the default applies. A real value
+still overrides, and it makes the documented *"leave empty to resolve from
+PATH"* true for `FFMPEG_PATH` / `FFPROBE_PATH`, where `""` would otherwise be an
+unresolvable path rather than a fallback.
 
 #### Other serverless caveats
 
