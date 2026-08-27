@@ -205,7 +205,15 @@ def fetch(*, url: str, directory: Path) -> tuple[Path, str]:
     if len(url) > 2048:
         raise DownloadError("That link is too long.")
 
-    if media_site.enabled() and media_site.is_media_site_url(url):
+    if media_site.is_media_site_url(url):
+        if not media_site.enabled():
+            # Otherwise this falls through to the direct path and comes back as
+            # "that does not look like a video file", which reads as though the
+            # user mistyped the link.
+            raise DownloadError(
+                "Links from video sites are not supported on this server. "
+                "Download the video yourself and upload the file."
+            )
         try:
             return _fetch_via_extractor(url, directory)
         except media_site.MediaSiteError as exc:

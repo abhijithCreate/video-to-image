@@ -26,6 +26,7 @@
     "MAX_OUTPUT_IMAGES": "100",
     "JOB_RETENTION_MINUTES": "60",
     "TEMP_DIR": "/tmp/video-to-image",
-    "MAX_DOWNLOAD_CLIENTS": "3"
+    "MAX_DOWNLOAD_CLIENTS": "3",
+    "ALLOW_MEDIA_SITE_URLS": "false"
   }
 }

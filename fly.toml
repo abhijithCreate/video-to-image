@@ -1,0 +1,60 @@
+# Fly.io deployment. Builds the repo Dockerfile, which already bundles FFmpeg.
+#
+#   fly launch --copy-config --no-deploy   # first time: claims the app name
+#   fly deploy
+#
+# Run ONE machine. A job is written to one machine's own /tmp, and the later
+# /api/process and /api/download requests have to reach that same machine:
+#
+#   fly scale count 1
+
+app = "video-to-image"
+primary_region = "bom"          # Mumbai; change to your nearest region
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  APP_ENV = "production"
+  TEMP_DIR = "/tmp/video-to-image"
+  MAX_UPLOAD_SIZE_MB = "50"
+  MAX_VIDEO_DURATION_SECONDS = "60"
+  MAX_OUTPUT_IMAGES = "300"
+  # Kept well under the machine's rootfs: a large lossless batch is the one
+  # thing that can fill the disk.
+  MAX_TOTAL_OUTPUT_MB = "1024"
+  JOB_RETENTION_MINUTES = "60"
+  MAX_DOWNLOAD_CLIENTS = "3"
+  ALLOW_URL_UPLOADS = "true"
+  # Off deliberately. Video sites challenge datacenter IPs, and every cloud
+  # host has one, so YouTube links fail here even though they work from a home
+  # or office connection. Turn on only if you also supply YOUTUBE_COOKIES_FILE.
+  ALLOW_MEDIA_SITE_URLS = "false"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_start_machines = true
+  # Suspend rather than stop: resuming keeps the filesystem, so a job created
+  # just before an idle period is still there afterwards.
+  auto_stop_machines = "suspend"
+  # Keep one machine up so a conversion in progress is never interrupted.
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 20
+    hard_limit = 25
+
+[[http_service.checks]]
+  grace_period = "10s"
+  interval = "30s"
+  method = "GET"
+  path = "/health"
+  timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  # Frames stream through Pillow one at a time, but FFmpeg decoding a 1080p
+  # source wants headroom.
+  memory = "1gb"

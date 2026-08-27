@@ -12,6 +12,7 @@ root, which is exactly the condition that hides the bug.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -212,3 +213,78 @@ def test_the_whole_app_survives_a_blank_vercel_style_environment(
     with TestClient(create_app()) as client:
         assert client.get("/").status_code == 200
         assert client.get("/health").status_code == 200
+
+
+# ---------- container-host deployment ----------
+
+
+def test_the_container_listens_on_an_injected_port():
+    """Render and Railway assign $PORT at run time, so it cannot be baked in;
+    a container that ignores it fails their health checks."""
+    dockerfile = Path("Dockerfile").read_text()
+    assert "${PORT:-8000}" in dockerfile
+    # `exec` keeps uvicorn as PID 1 so the platform's SIGTERM reaches it.
+    assert 'CMD ["sh", "-c", "exec uvicorn' in dockerfile
+    # The healthcheck has to follow the same port.
+    assert "os.environ.get('PORT'" in dockerfile
+
+
+def _config_env_keys() -> dict[str, set[str]]:
+    """Env keys declared in the deploy configs, without a YAML dependency."""
+    import tomllib
+
+    fly = set(tomllib.loads(Path("fly.toml").read_text())["env"])
+    render = set(
+        re.findall(r"^\s*-\s*key:\s*([A-Z0-9_]+)\s*$", Path("render.yaml").read_text(), re.M)
+    )
+    return {"fly.toml": fly, "render.yaml": render}
+
+
+def test_deploy_configs_only_set_settings_that_exist():
+    """A typo'd key in a deploy config is a silent no-op."""
+    from app.config import Settings
+
+    known = {name.upper() for name in Settings.model_fields}
+    for label, keys in _config_env_keys().items():
+        assert keys, f"{label}: parsed no env keys"
+        assert not (keys - known), f"{label} sets unknown keys: {sorted(keys - known)}"
+
+
+def test_deploy_configs_pin_a_single_instance():
+    """Jobs live on one instance's /tmp: the later process and download
+    requests must reach the same instance, so scaling out breaks conversions."""
+    import tomllib
+
+    render = Path("render.yaml").read_text()
+    assert re.search(r"^\s*numInstances:\s*1\s*$", render, re.M)
+
+    fly = tomllib.loads(Path("fly.toml").read_text())
+    # One machine kept warm, so an in-flight conversion is never interrupted.
+    assert fly["http_service"]["min_machines_running"] == 1
+    assert fly["http_service"]["internal_port"] == 8000
+
+
+def test_deploy_configs_run_in_production_mode():
+    from app.config import Settings
+
+    for label, keys in _config_env_keys().items():
+        assert "APP_ENV" in keys, label
+    assert Settings(_env_file=None, app_env="production").is_production is True
+
+
+def test_deploy_configs_disable_video_site_links():
+    """Every cloud host has a datacenter IP, and video sites challenge those,
+    so a server deploy must not offer a field that cannot work."""
+    import json
+    import tomllib
+
+    assert tomllib.loads(Path("fly.toml").read_text())["env"][
+        "ALLOW_MEDIA_SITE_URLS"
+    ] == "false"
+
+    render = Path("render.yaml").read_text()
+    block = render[render.index("ALLOW_MEDIA_SITE_URLS") :]
+    assert re.search(r'value:\s*"false"', block.split("- key:")[0])
+
+    vercel = json.loads(Path("vercel.json").read_text())
+    assert vercel["env"]["ALLOW_MEDIA_SITE_URLS"] == "false"

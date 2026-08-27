@@ -291,9 +291,12 @@ Three caveats worth knowing:
 - **Terms of service.** Downloading videos from YouTube is against its Terms of
   Service. That is a decision for whoever runs this server, not something the
   code can settle.
-- **Bot checks happen, and are usually temporary.** YouTube challenges clients
-  by IP — after a burst of requests, and far more readily from a datacenter than
-  from a home or office connection. See *When the bot check fires* below.
+- **This does not work from a server.** YouTube challenges clients by IP, and
+  every cloud host — Vercel, Fly, Railway, Render, any VPS — has a datacenter
+  IP. Expect it to work from a home or office connection and to fail on a
+  deployment. The deploy configs therefore ship
+  `ALLOW_MEDIA_SITE_URLS=false`, which removes the field rather than offering
+  something that cannot work. See *When the bot check fires* below.
 - **yt-dlp needs bumping.** Extractors break whenever a site changes its player.
   The pin in `requirements.txt` will go stale; update it when links start
   failing.
@@ -323,7 +326,27 @@ things handle it, in order of how little they cost you:
    credentials — mount them as a secret, never bake them into the image.
 
 If none of that suits, `ALLOW_MEDIA_SITE_URLS=false` takes the field off the
-page and leaves direct file links working.
+page and leaves direct file links working. A video-site link then reports
+*"Links from video sites are not supported on this server"* rather than falling
+through to the direct path and claiming the link is not a video file.
+
+#### Why moving hosts does not fix it
+
+The challenge is about the **IP**, not the platform. Moving from Vercel to Fly,
+Railway or Render changes nothing here — they are all datacenters. That is why
+`fly.toml`, `render.yaml` and `vercel.json` all set
+`ALLOW_MEDIA_SITE_URLS=false`, and a test asserts they still do.
+
+Three ways to actually have it work on a server, none of them free:
+
+1. **Cookies from a logged-in account** (`YOUTUBE_COOKIES_FILE`). Effective, but
+   those cookies are account credentials, they expire, and using a residential
+   session from a datacenter IP is a good way to get the account flagged. Use a
+   throwaway account, mount the file as a secret, never bake it into an image.
+2. **Route the extractor through a residential proxy.** Reliable, costs money,
+   and adds a dependency to every fetch.
+3. **Leave it off in production** and keep it for local use, where it works
+   without any of the above. This is what the shipped configs do.
 
 ### Security
 
@@ -338,6 +361,31 @@ page and leaves direct file links working.
 
 ## Deployment notes
 
+FFmpeg is the deciding factor: this app cannot extract a frame without it, and
+a platform that does not provide it cannot run this app. Anything that takes a
+Dockerfile works, because the image bundles FFmpeg itself.
+
+### Container hosts (recommended)
+
+`fly.toml` and `render.yaml` are ready to use; Railway needs no config file at
+all — it detects the Dockerfile.
+
+```bash
+fly launch --copy-config --no-deploy && fly deploy && fly scale count 1
+# or: push the repo and point Render at it (render.yaml is a blueprint)
+# or: railway up
+```
+
+**Run exactly one instance.** A job is written to one instance's own `/tmp`, and
+the later `/api/process` and `/api/download` requests must reach that same
+instance. Scaling out makes conversions fail intermittently with *"This job has
+expired or no longer exists."* Both configs pin a single instance for this
+reason; a test asserts they still do.
+
+The container reads `$PORT` (default 8000), which Render and Railway assign at
+run time. `uvicorn` runs as PID 1 via `exec`, so a platform SIGTERM shuts it
+down cleanly instead of being swallowed by a shell.
+
 ### Docker
 
 Runs as a non-root user (uid 10001). Jobs live on the container's own ephemeral
@@ -346,10 +394,24 @@ which is more than is sensible to hold in RAM. Nothing is persisted — the
 directory dies with the container, and the retention sweep clears jobs long
 before that. `docker compose up --build` serves port 8000.
 
-### Vercel
+### Vercel (not viable for processing)
 
 `vercel.json` deploys `app/main.py` as a Python serverless function with
-conservative limits (20 MB upload, 20 s duration, 100 images).
+conservative limits (20 MB upload, 20 s duration, 100 images). It is kept for
+reference; **use a container host instead**. Two problems are not fixable in
+configuration:
+
+- **No FFmpeg**, so nothing can be converted (below).
+- **Ephemeral, per-instance disk.** The three-step flow spans three requests,
+  and each may land on a different instance, so a job written during upload is
+  often gone by `/api/process`. Bundling FFmpeg does not help with this.
+
+For the record, bundling FFmpeg *would* just fit: static `ffmpeg` + `ffprobe`
+are 160 MB uncompressed against a 250 MB cap, on top of ~79 MB of dependencies —
+239 MB, leaving 11 MB of headroom, and requiring the binaries be copied to
+`/tmp` and `chmod +x`'d at run time because the executable bit is not preserved.
+That is a lot of fragility for a deployment that still loses jobs between
+requests.
 
 **It will serve the page, but it cannot convert video.** The Vercel Python
 runtime ships no FFmpeg, so every upload is refused with *"Video processing is

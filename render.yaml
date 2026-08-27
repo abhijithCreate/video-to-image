@@ -1,0 +1,47 @@
+# Render blueprint. Builds the repo Dockerfile, which already bundles FFmpeg.
+# Point Render at this repo and it picks this file up automatically.
+#
+# Render injects $PORT; the Dockerfile's CMD honours it.
+#
+# numInstances stays 1 on purpose. A job is written to one instance's own /tmp,
+# and the later /api/process and /api/download requests have to reach that same
+# instance - scaling out would make conversions fail intermittently with
+# "This job has expired or no longer exists."
+
+services:
+  - type: web
+    name: video-to-image
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: singapore # nearest to South Asia; see Render's region list
+    numInstances: 1
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: TEMP_DIR
+        value: /tmp/video-to-image
+      - key: MAX_UPLOAD_SIZE_MB
+        value: "50"
+      - key: MAX_VIDEO_DURATION_SECONDS
+        value: "60"
+      - key: MAX_OUTPUT_IMAGES
+        value: "300"
+      # The free plan's disk is small, and a lossless batch is the one thing
+      # that can fill it.
+      - key: MAX_TOTAL_OUTPUT_MB
+        value: "1024"
+      - key: JOB_RETENTION_MINUTES
+        value: "60"
+      - key: MAX_DOWNLOAD_CLIENTS
+        value: "3"
+      - key: ALLOW_URL_UPLOADS
+        value: "true"
+      # Off deliberately. Video sites challenge datacenter IPs, and every cloud
+      # host has one, so YouTube links fail here even though they work from a
+      # home or office connection. Turn on only if you also supply
+      # YOUTUBE_COOKIES_FILE.
+      - key: ALLOW_MEDIA_SITE_URLS
+        value: "false"

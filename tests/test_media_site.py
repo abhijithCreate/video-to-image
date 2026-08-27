@@ -438,3 +438,20 @@ def test_the_retry_chain_stops_when_the_budget_is_spent(monkeypatch, tmp_path):
         media_site.fetch(url="https://youtu.be/abc", directory=tmp_path)
     # The first attempt still happens; the fallback is skipped.
     assert tried == [None]
+
+
+def test_a_video_site_link_says_so_when_the_extractor_is_off(monkeypatch, tmp_path):
+    """Falling through to the direct path reports "that does not look like a
+    video file", which reads as though the user mistyped the link."""
+    monkeypatch.setattr(settings, "allow_media_site_urls", False)
+
+    with pytest.raises(download.DownloadError, match="not supported on this server"):
+        download.fetch(url="https://youtu.be/abc123", directory=tmp_path)
+
+
+def test_that_message_also_covers_yt_dlp_not_being_installed(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "allow_media_site_urls", True)
+    monkeypatch.setattr(media_site, "available", lambda: False)
+
+    with pytest.raises(download.DownloadError, match="not supported on this server"):
+        download.fetch(url="https://www.youtube.com/watch?v=abc", directory=tmp_path)
