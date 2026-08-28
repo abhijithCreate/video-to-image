@@ -266,22 +266,24 @@ def test_deploy_configs_run_in_production_mode():
     assert Settings(_env_file=None, app_env="production").is_production is True
 
 
-def test_deploy_configs_disable_video_site_links():
-    """Every cloud host has a datacenter IP, and video sites challenge those,
-    so a server deploy must not offer a field that cannot work."""
+def test_deploy_configs_enable_video_site_links():
+    """Enabled on request. It needs YOUTUBE_COOKIES to be reliable from a
+    datacenter IP, and the configs say so in a comment."""
     import json
     import tomllib
 
     assert tomllib.loads(Path("fly.toml").read_text())["env"][
         "ALLOW_MEDIA_SITE_URLS"
-    ] == "false"
+    ] == "true"
+    assert "YOUTUBE_COOKIES" in Path("fly.toml").read_text()
 
     render = Path("render.yaml").read_text()
     block = render[render.index("ALLOW_MEDIA_SITE_URLS") :]
-    assert re.search(r'value:\s*"false"', block.split("- key:")[0])
+    assert re.search(r'value:\s*"true"', block.split("- key:")[0])
+    assert "YOUTUBE_COOKIES" in render
 
     vercel = json.loads(Path("vercel.json").read_text())
-    assert vercel["env"]["ALLOW_MEDIA_SITE_URLS"] == "false"
+    assert vercel["env"]["ALLOW_MEDIA_SITE_URLS"] == "true"
 
 
 def test_the_page_offers_no_upload_where_processing_cannot_work(
@@ -343,11 +345,12 @@ def test_the_app_shells_out_to_no_video_binary():
 
 
 def test_the_production_dependency_set_stays_lean():
-    """A serverless bundle is capped at 250 MB unzipped; the production set
-    measures ~142 MB, and these are the entries that would blow it."""
+    """A serverless bundle is capped at 250 MB unzipped. av (97 MB) and yt-dlp
+    (24 MB) earn their place; these do not."""
     prod = Path("requirements.txt").read_text()
     assert "av==" in prod
-    for excluded in ("yt-dlp", "pytest", "httpx", "numpy", "uvicorn[standard]"):
+    assert "yt-dlp==" in prod
+    for excluded in ("pytest", "httpx", "numpy", "uvicorn[standard]"):
         assert excluded not in prod, f"{excluded} belongs in requirements-dev.txt"
 
     dev = Path("requirements-dev.txt").read_text()
@@ -362,3 +365,16 @@ def test_the_bundle_cap_allows_the_decoder():
 
     config = json.loads(Path("vercel.json").read_text())
     assert config["builds"][0]["config"]["maxLambdaSize"] == "250mb"
+
+
+def test_vercel_converts_statelessly_and_container_hosts_do_not():
+    """Vercel spreads requests across instances, so a job cannot be kept. A
+    single-instance container host can, and keeps the preview grid."""
+    import json
+    import tomllib
+
+    vercel = json.loads(Path("vercel.json").read_text())
+    assert vercel["env"]["STATELESS_CONVERSION"] == "true"
+
+    assert "STATELESS_CONVERSION" not in tomllib.loads(Path("fly.toml").read_text())["env"]
+    assert "STATELESS_CONVERSION" not in Path("render.yaml").read_text()

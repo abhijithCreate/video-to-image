@@ -26,10 +26,11 @@ primary_region = "bom"          # Mumbai; change to your nearest region
   JOB_RETENTION_MINUTES = "60"
   MAX_DOWNLOAD_CLIENTS = "3"
   ALLOW_URL_UPLOADS = "true"
-  # Off deliberately. Video sites challenge datacenter IPs, and every cloud
-  # host has one, so YouTube links fail here even though they work from a home
-  # or office connection. Turn on only if you also supply YOUTUBE_COOKIES_FILE.
-  ALLOW_MEDIA_SITE_URLS = "false"
+  # On, but read this: video sites challenge datacenter IPs, and every cloud
+  # host has one. Without credentials most YouTube links will be refused here
+  # even though they work from a home connection. Set YOUTUBE_COOKIES (the
+  # contents of a cookies.txt) as a secret to get past it.
+  ALLOW_MEDIA_SITE_URLS = "true"
 
 [http_service]
   internal_port = 8000

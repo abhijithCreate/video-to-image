@@ -5,7 +5,15 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
@@ -125,6 +133,7 @@ async def index(request: Request) -> HTMLResponse:
             # No FFmpeg means no conversion is possible on this host. Say so up
             # front rather than letting someone upload and hit an error.
             "processing_available": video_service.ffmpeg_available(),
+            "stateless_conversion": settings.stateless_conversion,
             "accepted_labels": sorted(
                 ext.lstrip(".").upper() for ext in ALLOWED_VIDEO_EXTENSIONS
             ),
@@ -146,6 +155,10 @@ async def health() -> JSONResponse:
             "features": {
                 "url_uploads": settings.allow_url_uploads,
                 "media_sites": media_site_service.enabled(),
+                "stateless_conversion": settings.stateless_conversion,
+                # Without credentials a datacenter IP is usually refused, so
+                # this is the first thing to check when links stop working.
+                "media_site_cookies": media_site_service.cookies_configured(),
                 "zip_only": True,
                 "steps": 3,
             },
@@ -199,20 +212,9 @@ async def upload(
 
     job_id, directory = await run_in_threadpool(jobs.create)
     destination = directory / f"input{extension}"
-    written = 0
 
     try:
-        with destination.open("wb") as handle:
-            while chunk := await file.read(CHUNK_SIZE):
-                written += len(chunk)
-                if written > settings.max_upload_size_bytes:
-                    raise _bad_request(
-                        f"This video is larger than the {settings.max_upload_size_mb} MB limit."
-                    )
-                handle.write(chunk)
-        if written == 0:
-            raise _bad_request("The uploaded file is empty.")
-
+        await _receive(file, destination)
         payload = await run_in_threadpool(
             _finalise_upload, job_id, destination, original_name
         )
@@ -227,6 +229,35 @@ async def upload(
 
     background.add_task(jobs.purge_expired)
     return JSONResponse(payload)
+
+
+async def _receive(file: UploadFile, destination: Path) -> int:
+    """Stream an upload to disk, stopping the moment it exceeds the limit."""
+    written = 0
+    with destination.open("wb") as handle:
+        while chunk := await file.read(CHUNK_SIZE):
+            written += len(chunk)
+            if written > settings.max_upload_size_bytes:
+                raise _bad_request(
+                    f"This video is larger than the {settings.max_upload_size_mb} MB limit."
+                )
+            handle.write(chunk)
+    if written == 0:
+        raise _bad_request("The uploaded file is empty.")
+    return written
+
+
+def _extension_of(filename: str | None) -> str:
+    """The validated extension of an uploaded filename."""
+    name = Path(filename or "").name
+    extension = Path(name).suffix.lower()
+    if extension not in ALLOWED_VIDEO_EXTENSIONS:
+        raise _bad_request(
+            "Unsupported file type. Use "
+            + ", ".join(sorted(e.lstrip(".") for e in ALLOWED_VIDEO_EXTENSIONS)).upper()
+            + "."
+        )
+    return extension
 
 
 @router.post("/api/upload-url")
@@ -256,6 +287,83 @@ async def upload_url(
     return JSONResponse(payload)
 
 
+def _encode_frames(
+    *,
+    source: Path,
+    info: video_service.VideoInfo,
+    plan: video_service.ExtractionPlan,
+    options: image_service.ImageOptions,
+    output_dir: Path,
+    thumbs_dir: Path | None,
+) -> tuple[list[dict], tuple[int, int] | None]:
+    """Encode every planned frame, enforcing the output byte budget.
+
+    Shared by the job pipeline and the single-request converter, so the limits
+    and the fail-fast projection behave identically in both.
+    ``thumbs_dir`` of ``None`` skips previews.
+    """
+    source_size = (info.width, info.height)
+    target = image_service.compute_target_size(source_size, options)
+    size = video_service.frame_size(source_size, target)
+
+    def clear() -> None:
+        for directory in (output_dir, thumbs_dir):
+            if directory is not None and directory.is_dir():
+                for stale in directory.iterdir():
+                    stale.unlink(missing_ok=True)
+
+    images: list[dict] = []
+    written = 0
+    budget = settings.max_total_output_bytes
+
+    for index, timestamp, data in video_service.stream_frames(
+        source=source,
+        plan=plan,
+        source_size=source_size,
+        target_size=target,
+    ):
+        frame = image_service.open_frame(data, size)
+        entry = image_service.save(
+            frame=frame,
+            destination=output_dir / options.frame_name(index),
+            options=options,
+            target_size=target,
+        )
+        thumb_name = None
+        if thumbs_dir is not None:
+            thumb_name = f"frame_{index:05d}.jpg"
+            image_service.save_thumbnail(
+                frame=frame,
+                destination=thumbs_dir / thumb_name,
+                longest_edge=settings.thumbnail_size,
+            )
+        entry.update({"frame": index, "timestamp": timestamp, "thumbnail": thumb_name})
+        images.append(entry)
+        written += entry["size_bytes"]
+
+        # Fail fast: if the first frame already projects far past the budget,
+        # say so now rather than after minutes of encoding.
+        if index == 1 and entry["size_bytes"] * plan.count > budget * 1.25:
+            (output_dir / entry["filename"]).unlink(missing_ok=True)
+            projected = entry["size_bytes"] * plan.count / (1024 * 1024)
+            raise OutputTooLarge(
+                f"{plan.count} images at these settings would produce roughly "
+                f"{projected:.0f} MB, over the {settings.max_total_output_mb} MB limit. "
+                "Reduce the number of images or the resolution, or choose JPG or WebP "
+                "instead of a lossless format."
+            )
+
+        if written > budget:
+            clear()
+            raise OutputTooLarge(
+                f"These settings would produce more than {settings.max_total_output_mb} MB "
+                "of images. Reduce the number of images or the resolution, or choose "
+                "JPG or WebP instead of a lossless format."
+            )
+
+    return images, target
+
+
 def _process(payload: ProcessRequest) -> dict:
     """Blocking pipeline: extract with FFmpeg, encode with Pillow, index results."""
     meta = jobs.read_meta(payload.job_id)
@@ -281,68 +389,20 @@ def _process(payload: ProcessRequest) -> dict:
         maintain_aspect=payload.maintain_aspect,
         title=payload.title,
     )
-    source_size = (info.width, info.height)
-    target = image_service.compute_target_size(source_size, options)
-    size = video_service.frame_size(source_size, target)
-
     output_dir = directory / "output"
     thumbs_dir = directory / "thumbs"
     for stale in list(output_dir.iterdir()) + list(thumbs_dir.iterdir()):
         stale.unlink(missing_ok=True)
     (directory / jobs.ARCHIVE_FILENAME).unlink(missing_ok=True)
 
-    images: list[dict] = []
-    written = 0
-    budget = settings.max_total_output_bytes
-    for index, timestamp, data in video_service.stream_frames(
+    images, target = _encode_frames(
         source=source,
+        info=info,
         plan=plan,
-        source_size=source_size,
-        target_size=target,
-    ):
-        frame = image_service.open_frame(data, size)
-        name = options.frame_name(index)
-        entry = image_service.save(
-            frame=frame,
-            destination=output_dir / name,
-            options=options,
-            target_size=target,
-        )
-        thumb_name = None
-        if not payload.zip_only:
-            thumb_name = f"frame_{index:05d}.jpg"
-            image_service.save_thumbnail(
-                frame=frame,
-                destination=thumbs_dir / thumb_name,
-                longest_edge=settings.thumbnail_size,
-            )
-        entry.update(
-            {"frame": index, "timestamp": timestamp, "thumbnail": thumb_name}
-        )
-        images.append(entry)
-
-        written += entry["size_bytes"]
-
-        # Fail fast: if the first frame already projects far past the budget,
-        # say so now rather than after minutes of encoding.
-        if index == 1 and entry["size_bytes"] * plan.count > budget * 1.25:
-            (output_dir / entry["filename"]).unlink(missing_ok=True)
-            projected = entry["size_bytes"] * plan.count / (1024 * 1024)
-            raise OutputTooLarge(
-                f"{plan.count} images at these settings would produce roughly "
-                f"{projected:.0f} MB, over the {settings.max_total_output_mb} MB limit. "
-                "Reduce the number of images or the resolution, or choose JPG or WebP "
-                "instead of a lossless format."
-            )
-
-        if written > budget:
-            for stale in list(output_dir.iterdir()) + list(thumbs_dir.iterdir()):
-                stale.unlink(missing_ok=True)
-            raise OutputTooLarge(
-                f"These settings would produce more than {settings.max_total_output_mb} MB "
-                "of images. Reduce the number of images or the resolution, or choose "
-                "JPG or WebP instead of a lossless format."
-            )
+        options=options,
+        output_dir=output_dir,
+        thumbs_dir=None if payload.zip_only else thumbs_dir,
+    )
 
     meta.update(
         {
@@ -428,6 +488,100 @@ def _public(meta: dict) -> dict:
         ],
         "download_all_url": f"/api/download-all/{job_id}",
     }
+
+
+@router.post("/api/convert")
+async def convert(
+    background: BackgroundTasks,
+    file: UploadFile = File(...),
+    method: str = Form("fps"),
+    fps: float | None = Form(None),
+    count: int | None = Form(None),
+    interval: float | None = Form(None),
+    image_format: str = Form("jpg"),
+    quality_preset: str = Form("high"),
+    quality: int | None = Form(None),
+    width: int | None = Form(None),
+    height: int | None = Form(None),
+    maintain_aspect: bool = Form(True),
+    title: str | None = Form(None),
+) -> FileResponse:
+    """Upload, convert and return the archive in one request.
+
+    The three-step flow keeps a job on disk between requests, which only works
+    where every request reaches the same machine. On a platform that spreads
+    requests across instances the job written during upload is often missing by
+    the time a preview or download arrives. This endpoint holds no state: the
+    work directory is deleted once the response has been sent.
+    """
+    extension = _extension_of(file.filename)
+    job_id, directory = await run_in_threadpool(jobs.create)
+    source = directory / f"input{extension}"
+
+    try:
+        await _receive(file, source)
+
+        def run() -> tuple[Path, str]:
+            info = video_service.probe(source, original_filename=file.filename)
+            if info.duration > settings.max_video_duration_seconds:
+                raise _bad_request(
+                    "This video is longer than the "
+                    f"{settings.max_video_duration_seconds} second limit."
+                )
+            if info.width <= 0 or info.height <= 0:
+                raise _bad_request("This video has no usable picture dimensions.")
+
+            plan = video_service.resolve_plan(
+                method=method, info=info, fps=fps, count=count, interval=interval
+            )
+            options = image_service.resolve_options(
+                fmt=image_format,
+                quality_preset=quality_preset,
+                quality=quality,
+                width=width,
+                height=height,
+                maintain_aspect=maintain_aspect,
+                title=title,
+            )
+            output_dir = directory / "output"
+            images, _ = _encode_frames(
+                source=source,
+                info=info,
+                plan=plan,
+                options=options,
+                output_dir=output_dir,
+                thumbs_dir=None,  # nothing survives to be previewed
+            )
+            archive = zip_service.build_archive(
+                files=[output_dir / item["filename"] for item in images],
+                destination=directory / jobs.ARCHIVE_FILENAME,
+            )
+            name = f"{options.title}.zip" if options.title else f"images-{job_id[:8]}.zip"
+            return archive, name
+
+        archive, download_name = await run_in_threadpool(run)
+    except (
+        video_service.VideoError,
+        image_service.ImageError,
+        zip_service.ZipError,
+        OutputTooLarge,
+    ) as exc:
+        await run_in_threadpool(jobs.delete, job_id)
+        raise _bad_request(str(exc)) from exc
+    except HTTPException:
+        await run_in_threadpool(jobs.delete, job_id)
+        raise
+    finally:
+        await file.close()
+
+    # Runs after the archive has been streamed, so nothing lingers on disk.
+    background.add_task(jobs.delete, job_id)
+    return FileResponse(
+        archive,
+        media_type="application/zip",
+        filename=download_name,
+        background=background,
+    )
 
 
 @router.get("/api/result/{job_id}")

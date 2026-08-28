@@ -577,3 +577,103 @@ def test_odd_widths_are_packed_without_row_padding(client, sample_video):
         # A stride bug shows up as the last column being padding, not picture.
         right_edge = image.convert("RGB").crop((640, 0, 641, 361)).getextrema()
         assert any(lo != 0 or hi != 0 for lo, hi in right_edge)
+
+
+@needs_ffmpeg
+def test_convert_returns_the_archive_in_one_request(client, sample_video):
+    """No job is kept, so nothing can be lost between requests."""
+    with sample_video.open("rb") as handle:
+        response = client.post(
+            "/api/convert",
+            files={"file": ("sample.mp4", handle, "video/mp4")},
+            data={
+                "method": "count",
+                "count": "3",
+                "image_format": "jpg",
+                "width": "320",
+                "title": "One Shot",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"] == "application/zip"
+    assert 'filename="One-Shot.zip"' in response.headers["content-disposition"]
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        assert archive.namelist() == [
+            "One-Shot_00001.jpg",
+            "One-Shot_00002.jpg",
+            "One-Shot_00003.jpg",
+        ]
+
+
+@needs_ffmpeg
+def test_convert_leaves_nothing_on_disk(client, sample_video):
+    before = sorted(p.name for p in jobs.root().iterdir())
+    with sample_video.open("rb") as handle:
+        assert (
+            client.post(
+                "/api/convert",
+                files={"file": ("sample.mp4", handle, "video/mp4")},
+                data={"method": "count", "count": "2"},
+            ).status_code
+            == 200
+        )
+    assert sorted(p.name for p in jobs.root().iterdir()) == before
+
+
+@needs_ffmpeg
+def test_convert_cleans_up_after_a_rejected_request(client, sample_video):
+    before = sorted(p.name for p in jobs.root().iterdir())
+    with sample_video.open("rb") as handle:
+        response = client.post(
+            "/api/convert",
+            files={"file": ("sample.mp4", handle, "video/mp4")},
+            data={"method": "fps", "fps": "0"},
+        )
+    assert response.status_code == 400
+    assert "Frame rate" in response.json()["error"]
+    assert sorted(p.name for p in jobs.root().iterdir()) == before
+
+
+def test_convert_rejects_a_non_video_extension(client):
+    response = client.post(
+        "/api/convert",
+        files={"file": ("notes.txt", io.BytesIO(b"nope"), "text/plain")},
+        data={"method": "count", "count": "1"},
+    )
+    assert response.status_code == 400
+    assert "Unsupported file type" in response.json()["error"]
+
+
+@needs_ffmpeg
+def test_convert_enforces_the_duration_limit(client, sample_video, monkeypatch):
+    monkeypatch.setattr(settings, "max_video_duration_seconds", 1)
+    with sample_video.open("rb") as handle:
+        response = client.post(
+            "/api/convert",
+            files={"file": ("sample.mp4", handle, "video/mp4")},
+            data={"method": "count", "count": "2"},
+        )
+    assert response.status_code == 400
+    assert "longer than" in response.json()["error"]
+
+
+def test_stateless_mode_is_advertised_to_the_page_and_health(client, monkeypatch):
+    monkeypatch.setattr(settings, "stateless_conversion", True)
+    assert client.get("/health").json()["features"]["stateless_conversion"] is True
+    body = client.get("/").text
+    assert 'data-stateless="true"' in body
+    # ZIP-only is implied when there is nothing left to preview.
+    assert "Generate &amp; download ZIP" in body
+
+
+def test_the_retention_notice_matches_the_mode(client, monkeypatch):
+    """In stateless mode nothing is stored, so promising an hour would lie."""
+    stored = client.get("/").text
+    assert "removed from our servers" in stored
+    assert "Nothing was kept on the server" not in stored
+
+    monkeypatch.setattr(settings, "stateless_conversion", True)
+    stateless = client.get("/").text
+    assert "Nothing was kept on the server" in stateless
+    assert "removed from our servers" not in stateless

@@ -14,7 +14,9 @@ direct links; the feature reports itself as unavailable instead.
 
 from __future__ import annotations
 
+import os
 import re
+import tempfile
 import time
 import urllib.parse
 from pathlib import Path
@@ -207,16 +209,51 @@ def _format_selector() -> str:
     )
 
 
+def _cookies_from_env() -> Path | None:
+    """Materialise YOUTUBE_COOKIES into a file yt-dlp can read.
+
+    A serverless host has no way to mount a secret file, only environment
+    variables, so the jar arrives as text. It is written once per process to a
+    private file under the temp directory - 0600, because these are account
+    credentials, and never logged.
+    """
+    contents = settings.youtube_cookies or ""
+    if not contents.strip():
+        return None
+
+    target = Path(tempfile.gettempdir()) / "video-to-image-cookies.txt"
+    try:
+        if not target.exists() or target.read_text(encoding="utf-8") != contents:
+            # Create with the mode set, rather than widening it afterwards.
+            handle = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(handle, "w", encoding="utf-8") as file:
+                file.write(contents)
+    except OSError:  # pragma: no cover - read-only temp dir
+        return None
+    return target
+
+
 def _cookie_options() -> dict[str, Any]:
     """Credentials for a site that will not serve an anonymous client."""
     options: dict[str, Any] = {}
+
     cookie_file = settings.youtube_cookies_file
     if cookie_file and Path(cookie_file).is_file():
         options["cookiefile"] = str(cookie_file)
+    else:
+        from_env = _cookies_from_env()
+        if from_env is not None:
+            options["cookiefile"] = str(from_env)
+
     browser = (settings.youtube_cookies_from_browser or "").strip()
     if browser:
         options["cookiesfrombrowser"] = (browser,)
     return options
+
+
+def cookies_configured() -> bool:
+    """Whether any credentials are set, for /health to report."""
+    return bool(_cookie_options())
 
 
 def _options(directory: Path, *, client: str | None = None) -> dict[str, Any]:

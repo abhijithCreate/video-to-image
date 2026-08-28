@@ -12,3 +12,8 @@ pillow==11.1.0
 # its wheel, so no ffmpeg binary needs to exist on the host. This is what lets
 # the app run somewhere it cannot install system packages.
 av==18.1.0
+
+# Resolves video-site pages (YouTube and similar) to a downloadable stream.
+# 24 MB, which the 250 MB budget accommodates. Extractors break when sites
+# change their player, so this pin needs bumping periodically.
+yt-dlp==2026.8.19

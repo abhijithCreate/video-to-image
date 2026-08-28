@@ -1,6 +1,3 @@
-# Optional features. The app runs without these and reports them unavailable.
-
-# Resolves video-site pages (YouTube and similar) to a downloadable stream.
-# Installs to 24 MB, and video sites block datacenter IPs anyway, so it is not
-# part of the production set. Extractors break when sites change: bump often.
-yt-dlp==2026.8.19
+# Optional extras. Currently empty: yt-dlp moved into requirements.txt because
+# video-site links are a wanted feature, and it fits the serverless budget.
+# Kept as the place for future optional dependencies.

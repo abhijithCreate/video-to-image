@@ -87,12 +87,24 @@ class Settings(BaseSettings):
     # logged-in session to a video site is a decision for the operator.
     youtube_cookies_file: Path | None = None
     youtube_cookies_from_browser: str = ""
+    # The contents of a cookies.txt, for hosts where no file can be mounted -
+    # a serverless platform offers environment variables and nothing else.
+    # Treated as a secret: written to a private temp file, never logged.
+    youtube_cookies: str = ""
 
     # Wall-clock ceiling for decoding one job.
     process_timeout_seconds: int = 600
 
     # Longest edge of a grid thumbnail, in pixels.
     thumbnail_size: int = 320
+
+    # Convert in a single request and stream the ZIP straight back, holding no
+    # job on disk. Needed wherever consecutive requests are not guaranteed to
+    # reach the same instance - a serverless platform writes the job to one
+    # instance's /tmp, and the previews and downloads that follow may land on
+    # another and 404. The cost is the preview grid: there is nothing left to
+    # preview afterwards.
+    stateless_conversion: bool = False
 
     @property
     def max_upload_size_bytes(self) -> int:

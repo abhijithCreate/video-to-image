@@ -27,6 +27,7 @@
     "JOB_RETENTION_MINUTES": "60",
     "TEMP_DIR": "/tmp/video-to-image",
     "MAX_DOWNLOAD_CLIENTS": "3",
-    "ALLOW_MEDIA_SITE_URLS": "false"
+    "ALLOW_MEDIA_SITE_URLS": "true",
+    "STATELESS_CONVERSION": "true"
   }
 }

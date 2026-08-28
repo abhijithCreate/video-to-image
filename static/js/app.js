@@ -5,9 +5,15 @@
   var $ = function (id) { return document.getElementById(id); };
 
   var state = {
-    jobId: null, images: [], objectUrl: null, busy: false,
+    jobId: null, images: [], objectUrl: null, blobUrl: null, file: null, busy: false,
     step: 'upload', hasResults: false
   };
+
+  /* Where consecutive requests are not guaranteed to reach the same instance,
+     a job cannot be kept on disk between them: the previews and downloads that
+     follow an upload would 404 on a machine that never saw it. In that mode the
+     whole conversion happens in one request and the ZIP comes straight back. */
+  var STATELESS = document.getElementById('main').dataset.stateless === 'true';
 
   var LOSSY = { jpg: true, jpeg: true, webp: true };
   var FORMAT_NOTES = {
@@ -47,7 +53,9 @@
 
   function reachable(step) {
     if (step === 'upload') return true;
-    if (step === 'configure') return !!state.jobId;
+    // A job id in the normal flow; in stateless mode there is no job, and the
+    // file we are about to convert is held client-side instead.
+    if (step === 'configure') return !!(state.jobId || state.file);
     return state.hasResults;
   }
 
@@ -141,6 +149,7 @@
   function startUpload(file) {
     clearError();
     if (state.busy) return;
+    if (STATELESS) return inspectLocally(file);
     state.busy = true;
 
     var progress = $('upload-progress');
@@ -184,6 +193,59 @@
     });
 
     request.send(body);
+  }
+
+  /* Describe the file without a server round trip, since a stateless host
+     would not keep an upload between requests anyway.
+
+     Best-effort on purpose. A <video> can only report duration and dimensions
+     for formats the browser itself decodes, and MKV, AVI and MPEG are accepted
+     here but decodable by no browser. The server computes the extraction plan
+     from its own probe regardless, so unknown values here are cosmetic and must
+     never block the flow. */
+  var LOCAL_PROBE_TIMEOUT_MS = 2500;
+
+  function inspectLocally(file) {
+    state.file = file;
+
+    var url = URL.createObjectURL(file);
+    var probe = document.createElement('video');
+    probe.preload = 'metadata';
+    var settled = false;
+
+    function proceed(video) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      URL.revokeObjectURL(url);
+      onUploaded(file, { job_id: null, video: video });
+    }
+
+    function describe(duration, width, height) {
+      return {
+        filename: file.name,
+        size_bytes: file.size,
+        duration: duration || 0,
+        width: width || 0,
+        height: height || 0,
+        fps: 0,
+        format_name: (file.name.split('.').pop() || '').toUpperCase(),
+        codec: ''
+      };
+    }
+
+    var timer = setTimeout(function () {
+      proceed(describe(0, 0, 0));
+    }, LOCAL_PROBE_TIMEOUT_MS);
+
+    probe.addEventListener('loadedmetadata', function () {
+      proceed(describe(probe.duration, probe.videoWidth, probe.videoHeight));
+    });
+    probe.addEventListener('error', function () {
+      proceed(describe(0, 0, 0));
+    });
+
+    probe.src = url;
   }
 
   /* ---------- fetch from a URL ---------- */
@@ -269,10 +331,14 @@
     $('video-info').innerHTML = [
       ['Filename', info.filename],
       ['Size', formatBytes(info.size_bytes)],
-      ['Duration', formatDuration(info.duration)],
-      ['Resolution', info.width + ' x ' + info.height],
-      ['Frame rate', (info.fps || 0).toFixed(2) + ' fps'],
-      ['Format', info.format_name + ' / ' + String(info.codec).toUpperCase()]
+      ['Duration', info.duration ? formatDuration(info.duration) : 'Unknown'],
+      ['Resolution', info.width && info.height
+        ? info.width + ' x ' + info.height
+        : 'Unknown'],
+      ['Frame rate', info.fps ? info.fps.toFixed(2) + ' fps' : 'Unknown'],
+      ['Format', info.codec
+        ? info.format_name + ' / ' + String(info.codec).toUpperCase()
+        : info.format_name]
     ].map(function (row) {
       return '<dt class="text-slate-500 dark:text-slate-400">' + row[0] + '</dt>' +
         '<dd class="truncate font-medium" title="' + escapeAttr(String(row[1])) + '">' +
@@ -514,7 +580,8 @@
 
   $('options-form').addEventListener('submit', async function (event) {
     event.preventDefault();
-    if (state.busy || !state.jobId) return;
+    if (state.busy) return;
+    if (STATELESS ? !state.file : !state.jobId) return;
     clearError();
 
     var payload = collectPayload();
@@ -534,13 +601,17 @@
     announce('Extracting frames.');
 
     try {
-      var response = await fetch('/api/process', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      if (!response.ok) throw new Error(await readError(response));
-      renderResults(await response.json());
+      if (STATELESS) {
+        await convertInOneRequest(payload);
+      } else {
+        var response = await fetch('/api/process', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        if (!response.ok) throw new Error(await readError(response));
+        renderResults(await response.json());
+      }
     } catch (error) {
       showError(error.message || 'The images could not be generated.');
     } finally {
@@ -556,7 +627,62 @@
     var button = $('generate');
     button.disabled = busy;
     $('generate-spinner').classList.toggle('hidden', !busy);
-    $('generate-label').textContent = busy ? 'Generating…' : 'Generate images';
+    $('generate-label').textContent = busy
+      ? 'Generating…'
+      : (STATELESS ? 'Generate & download ZIP' : 'Generate images');
+  }
+
+  /* Upload and convert in one request, because nothing can be kept on the
+     server between requests. The archive comes back as the response body. */
+  async function convertInOneRequest(payload) {
+    var body = new FormData();
+    body.append('file', state.file, state.file.name);
+    Object.keys(payload).forEach(function (key) {
+      if (key === 'job_id' || key === 'zip_only') return;
+      var value = payload[key];
+      if (value === undefined || value === null || value === '') return;
+      body.append(key, String(value));
+    });
+
+    var response = await fetch('/api/convert', { method: 'POST', body: body });
+    if (!response.ok) throw new Error(await readError(response));
+
+    var blob = await response.blob();
+    var name = filenameFrom(response.headers.get('content-disposition')) || 'images.zip';
+    if (state.blobUrl) URL.revokeObjectURL(state.blobUrl);
+    state.blobUrl = URL.createObjectURL(blob);
+
+    // Hand it over immediately, and leave the link in place to click again.
+    var link = document.createElement('a');
+    link.href = state.blobUrl;
+    link.download = name;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+
+    renderArchiveOnly(blob, name);
+  }
+
+  function filenameFrom(header) {
+    if (!header) return null;
+    var match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(header);
+    return match ? decodeURIComponent(match[1]) : null;
+  }
+
+  /* There is nothing to preview, so the results step is just the archive. */
+  function renderArchiveOnly(blob, name) {
+    state.images = [];
+    state.hasResults = true;
+    $('results-grid').innerHTML = '';
+    hide($('download-all'));
+    hide($('results-notice'));
+    show($('results-zip'));
+    $('results-summary').textContent = 'Your ZIP file is ready';
+    $('results-zip-detail').textContent = name + ' · ' + formatBytes(blob.size);
+    $('download-zip').href = state.blobUrl;
+    $('download-zip').setAttribute('download', name);
+    goToStep('results');
+    announce('Conversion finished. Your ZIP file has been downloaded.');
   }
 
   /* ---------- results ---------- */
@@ -631,6 +757,11 @@
     }
     state.jobId = null;
     state.images = [];
+    state.file = null;
+    if (state.blobUrl) {
+      URL.revokeObjectURL(state.blobUrl);
+      state.blobUrl = null;
+    }
     if (state.objectUrl) {
       URL.revokeObjectURL(state.objectUrl);
       state.objectUrl = null;

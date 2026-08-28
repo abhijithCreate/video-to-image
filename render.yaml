@@ -39,9 +39,9 @@ services:
         value: "3"
       - key: ALLOW_URL_UPLOADS
         value: "true"
-      # Off deliberately. Video sites challenge datacenter IPs, and every cloud
-      # host has one, so YouTube links fail here even though they work from a
-      # home or office connection. Turn on only if you also supply
-      # YOUTUBE_COOKIES_FILE.
+      # On, but read this: video sites challenge datacenter IPs, and every
+      # cloud host has one. Without credentials most YouTube links will be
+      # refused here even though they work from a home connection. Set
+      # YOUTUBE_COOKIES (the contents of a cookies.txt) as a secret.
       - key: ALLOW_MEDIA_SITE_URLS
-        value: "false"
+        value: "true"
