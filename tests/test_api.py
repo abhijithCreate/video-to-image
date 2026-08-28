@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import shutil
 import subprocess
 import zipfile
 
@@ -10,8 +11,12 @@ from app import jobs
 from app.config import settings
 from app.services import video as video_service
 
+# The app decodes in-process via PyAV and needs no binary. These fixtures still
+# shell out to the ffmpeg CLI to *synthesise* a test clip, which is a tooling
+# dependency, not an application one - so this checks for the binary directly.
 needs_ffmpeg = pytest.mark.skipif(
-    not video_service.ffmpeg_available(), reason="FFmpeg is not installed"
+    shutil.which("ffmpeg") is None,
+    reason="the ffmpeg CLI is needed to build test videos",
 )
 
 MISSING_JOB = "11111111-2222-3333-4444-555555555555"
@@ -23,7 +28,7 @@ def sample_video(tmp_path):
     path = tmp_path / "sample.mp4"
     subprocess.run(
         [
-            settings.ffmpeg_path, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
             "-f", "lavfi", "-i", "testsrc=size=320x180:rate=10:duration=3",
             "-pix_fmt", "yuv420p", str(path),
         ],
@@ -57,7 +62,18 @@ def test_index_offers_the_image_title_field(client):
     assert "frame_00001.jpg" in body
 
 
-def test_the_page_publishes_a_fetch_budget_for_the_browser(client):
+@pytest.fixture
+def processing_available(monkeypatch):
+    """The URL form only renders where frames can actually be extracted, and
+    this suite also runs on machines without FFmpeg."""
+    from app.services import video as video_service
+
+    monkeypatch.setattr(video_service, "ffmpeg_available", lambda: True)
+
+
+def test_the_page_publishes_a_fetch_budget_for_the_browser(
+    client, processing_available
+):
     """A URL fetch can run for a minute, so the spinner needs a deadline."""
     from app.services import media_site as media_site_service
 
@@ -72,7 +88,9 @@ def test_the_page_publishes_a_fetch_budget_for_the_browser(client):
     assert f'data-timeout-seconds="{expected}"' in body
 
 
-def test_the_fetch_budget_shrinks_without_the_extractor(client, monkeypatch):
+def test_the_fetch_budget_shrinks_without_the_extractor(
+    client, monkeypatch, processing_available
+):
     monkeypatch.setattr(settings, "allow_media_site_urls", False)
     body = client.get("/").text
     expected = settings.url_fetch_timeout_seconds + 15
@@ -168,7 +186,7 @@ def test_uploaded_mp4_is_reported_as_mp4(client, tmp_path):
     path = tmp_path / "GEMINI_GENERATED_VIDEO_18D1DA7B.MP4"
     subprocess.run(
         [
-            settings.ffmpeg_path, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
             "-f", "lavfi", "-i", "testsrc=size=320x180:rate=24:duration=2",
             "-pix_fmt", "yuv420p", "-c:v", "libx264", str(path),
         ],
@@ -189,7 +207,7 @@ def test_quicktime_named_mp4_is_reported_as_mov(client, tmp_path):
     real = tmp_path / "real.mov"
     subprocess.run(
         [
-            settings.ffmpeg_path, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
             "-f", "lavfi", "-i", "testsrc=size=320x180:rate=24:duration=2",
             "-pix_fmt", "yuv420p", "-c:v", "libx264", str(real),
         ],
@@ -524,3 +542,38 @@ def test_a_hostile_title_cannot_escape_the_output_directory(client, sample_video
     # Everything stayed inside the job's own output directory.
     output = jobs.directory(job_id) / "output"
     assert [path.name for path in output.iterdir()] == [name]
+
+
+@needs_ffmpeg
+def test_odd_widths_are_packed_without_row_padding(client, sample_video):
+    """libav aligns each row, so a 641px frame carries a 7696-byte stride for
+    7684 bytes of pixels. Packing it wrongly shears the image diagonally."""
+    with sample_video.open("rb") as handle:
+        job_id = client.post(
+            "/api/upload", files={"file": ("sample.mp4", handle, "video/mp4")}
+        ).json()["job_id"]
+
+    result = client.post(
+        "/api/process",
+        json={
+            "job_id": job_id,
+            "method": "count",
+            "count": 2,
+            "image_format": "png",
+            "width": 641,
+            "height": 361,
+            "maintain_aspect": False,
+        },
+    ).json()
+
+    assert result["images"][0]["width"] == 641
+    assert result["images"][0]["height"] == 361
+
+    from PIL import Image
+
+    body = client.get(result["images"][0]["url"]).content
+    with Image.open(io.BytesIO(body)) as image:
+        assert image.size == (641, 361)
+        # A stride bug shows up as the last column being padding, not picture.
+        right_edge = image.convert("RGB").crop((640, 0, 641, 361)).getextrema()
+        assert any(lo != 0 or hi != 0 for lo, hi in right_edge)

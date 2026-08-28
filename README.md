@@ -1,8 +1,9 @@
 # Video to Image
 
 Extract high-quality images from video frames. A single Python web application —
-FastAPI serves both the HTML page (Jinja2 + Tailwind) and the JSON API. FFmpeg
-decodes frames, Pillow encodes them.
+FastAPI serves both the HTML page (Jinja2 + Tailwind) and the JSON API. PyAV
+decodes frames in-process through FFmpeg's own libraries, Pillow encodes them.
+No `ffmpeg` binary has to exist on the host.
 
 A modern, self-hostable alternative to online tools such as ezgif's video-to-jpg.
 
@@ -31,11 +32,13 @@ A modern, self-hostable alternative to online tools such as ezgif's video-to-jpg
 ## Requirements
 
 - Python 3.12+
-- FFmpeg (provides `ffmpeg` and `ffprobe`)
+
+That is all. Decoding uses PyAV, whose wheel bundles
+libavformat/libavcodec/libavfilter, so there is no system FFmpeg to install.
 
 ## Run with Docker (recommended)
 
-FFmpeg is baked into the image, so this needs nothing else installed.
+Nothing else needs installing.
 
 ```bash
 docker compose up --build
@@ -48,10 +51,9 @@ Open <http://localhost:8000>.
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # or requirements.txt for runtime only
 
-cp .env.example .env          # optional — defaults work as-is
-brew install ffmpeg           # or: apt-get install ffmpeg
+cp .env.example .env                 # optional — defaults work as-is
 
 uvicorn app.main:app --reload
 ```
@@ -65,9 +67,9 @@ working directory, so it does not matter where you start the server from.
 pytest
 ```
 
-Tests that need a real video are skipped automatically when FFmpeg is not on
-`PATH`; `GET /health` reports whether the server can see it. To run *everything*
-without installing FFmpeg locally, use the image, which bundles it:
+A handful of tests *synthesise* a sample video with the `ffmpeg` CLI, which is
+tooling rather than an application dependency; they skip when the binary is
+absent. To run everything, use the image, which has it:
 
 ```bash
 docker run --rm -v "$PWD":/work -w /work -e HOME=/tmp \
@@ -120,7 +122,6 @@ committed.
 | `MEDIA_SITE_TIMEOUT_SECONDS` | `120` | Total budget for one page link, all client attempts |
 | `YOUTUBE_COOKIES_FILE` | *(unset)* | `cookies.txt` to send when a bot check will not let up |
 | `YOUTUBE_COOKIES_FROM_BROWSER` | *(unset)* | Read cookies from a local browser instead |
-| `FFMPEG_PATH` / `FFPROBE_PATH` | `ffmpeg` / `ffprobe` | Binary locations |
 | `PROCESS_TIMEOUT_SECONDS` | `600` | Wall-clock limit for one extraction run |
 
 ## API
@@ -128,7 +129,7 @@ committed.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/` | The application page |
-| `GET` | `/health` | Liveness plus FFmpeg availability |
+| `GET` | `/health` | Liveness plus whether a decoder is present |
 | `POST` | `/api/upload` | Multipart upload; validates and probes, returns `job_id` + metadata |
 | `POST` | `/api/process` | JSON options; extracts and encodes, returns the image index |
 | `GET` | `/api/result/{job_id}` | Re-read a completed job |
@@ -185,7 +186,7 @@ app/
 ├── jobs.py          temp job directories, metadata, cleanup, path safety
 ├── assets.py        content-hashed URLs for static files
 └── services/
-    ├── video.py      ffprobe metadata, extraction plans, FFmpeg frame decoding
+    ├── video.py       PyAV: container metadata, extraction plans, frame decoding
     ├── image.py      Pillow: format, quality, resize, compression, output naming
     ├── download.py   fetching a video from a URL, with SSRF protection
     ├── media_site.py resolving a video-site page (YouTube etc.) with yt-dlp
@@ -203,15 +204,36 @@ never stored permanently.
 
 ### Naming the container
 
-FFmpeg reports one demuxer name per container *family*, so an MP4 probes as
+libav reports one demuxer name per container *family*, so an MP4 probes as
 `mov,mp4,m4a,3gp,3g2,mj2` and a WebM as `matroska,webm`. Taking the first token
 would label every MP4 "MOV" and every WebM "MATROSKA", so `describe_format()`
 uses the file's own extension as the tie-breaker within a family.
 
+### Decoding in-process, not by subprocess
+
+`app/services/video.py` drives libavformat/libavcodec/libavfilter through PyAV
+rather than shelling out to `ffmpeg`. The reason was hosting: a serverless Python
+runtime has no FFmpeg on PATH and no way to install one, so the subprocess design
+simply could not run there. A wheel is only a dependency.
+
+It removed machinery as well — no argument lists, no stderr pipe to drain (an
+undrained pipe can deadlock FFmpeg), no process to reap on timeout. The filter
+graph is the same libavfilter the CLI drives, so `fps=` and `scale=` behave
+identically; a side-by-side run gave the same frame count, byte lengths and
+timestamps, differing only in colour-conversion rounding (~1% mean).
+
+One subtlety this exposed: libav aligns each row, so a plane's buffer can be
+wider than the picture — a 641px-wide frame carries a 7696-byte stride for 7684
+bytes of pixels. Pillow wants rows packed, so `_rgba_bytes` stitches a padded
+plane row by row. PyAV's `to_ndarray()` would do the same, at the cost of
+depending on numpy, which installs to 61 MB — most of a serverless budget. A test
+converts at 641×361 specifically to catch a regression here, which would show up
+as a diagonally sheared image.
+
 ### Frames are streamed, not staged
 
-FFmpeg writes raw RGBA frames to a pipe and Pillow encodes them one at a time, so
-no intermediate images ever touch the disk. That is what makes a 500-image limit
+The decoder hands over one raw RGBA frame at a time and Pillow encodes it
+immediately, so no intermediate images ever touch the disk. That is what makes a 500-image limit
 safe: staging 500 frames at 1080p as PNG first would cost up to ~2.4 GB of
 temporary space, where streaming costs zero and holds one frame (~8 MB) in memory.
 
@@ -356,14 +378,15 @@ Three ways to actually have it work on a server, none of them free:
   their own job directory (no traversal)
 - The user-supplied image title is folded to `A-Za-z0-9_-` before it ever reaches
   the filesystem, so a title like `../../etc/passwd` becomes `etc-passwd`
-- FFmpeg is invoked with an argument list — never `shell=True`
+- No subprocess at all: decoding is in-process, so there is no command line to
+  get injected into (a test asserts `video.py` imports neither `subprocess` nor
+  `shutil`)
 - Generic error messages; details are logged server-side only
 
 ## Deployment notes
 
-FFmpeg is the deciding factor: this app cannot extract a frame without it, and
-a platform that does not provide it cannot run this app. Anything that takes a
-Dockerfile works, because the image bundles FFmpeg itself.
+Nothing needs to be installed on the host: the decoder ships in a wheel, so any
+platform that can `pip install` and run Python can run this app.
 
 ### Container hosts (recommended)
 
@@ -394,32 +417,43 @@ which is more than is sensible to hold in RAM. Nothing is persisted — the
 directory dies with the container, and the retention sweep clears jobs long
 before that. `docker compose up --build` serves port 8000.
 
-### Vercel (not viable for processing)
+### Vercel
 
 `vercel.json` deploys `app/main.py` as a Python serverless function with
-conservative limits (20 MB upload, 20 s duration, 100 images). It is kept for
-reference; **use a container host instead**. Two problems are not fixable in
-configuration:
+conservative limits (20 MB upload, 20 s duration, 100 images).
 
-- **No FFmpeg**, so nothing can be converted (below).
-- **Ephemeral, per-instance disk.** The three-step flow spans three requests,
-  and each may land on a different instance, so a job written during upload is
-  often gone by `/api/process`. Bundling FFmpeg does not help with this.
+**Decoding works there.** That took moving off the `ffmpeg` binary — see
+[Decoding in-process](#decoding-in-process-not-by-subprocess). The production
+dependency set installs to **142 MB** against a 250 MB cap:
 
-For the record, bundling FFmpeg *would* just fit: static `ffmpeg` + `ffprobe`
-are 160 MB uncompressed against a 250 MB cap, on top of ~79 MB of dependencies —
-239 MB, leaving 11 MB of headroom, and requiring the binaries be copied to
-`/tmp` and `chmod +x`'d at run time because the executable bit is not preserved.
-That is a lot of fragility for a deployment that still loses jobs between
-requests.
+| | installed |
+| --- | --- |
+| `av` + `av.libs` | 97 MB |
+| Pillow | 18 MB |
+| pydantic, fastapi, jinja2, uvicorn, … | 16 MB |
+| **total** | **142 MB** |
 
-**It will serve the page, but it cannot convert video.** The Vercel Python
-runtime ships no FFmpeg, so every upload is refused with *"Video processing is
-unavailable on this server (FFmpeg not found)."* — a clean 400, and `/health`
-reports `"ffmpeg": false`. Treat a Vercel deploy as a demo of the UI unless you
-supply an `ffmpeg`/`ffprobe` binary in the bundle and point `FFMPEG_PATH` /
-`FFPROBE_PATH` at it. A static ffmpeg build is ~80 MB on its own, which runs
-straight into the bundle limit below.
+`requirements.txt` is deliberately the production set only. `yt-dlp` (24 MB),
+numpy (61 MB) and the test dependencies live in `requirements-extra.txt` and
+`requirements-dev.txt`, and `uvicorn` is the plain build rather than
+`uvicorn[standard]`, whose uvloop/httptools/watchfiles extras add ~26 MB that a
+serverless host never uses. `maxLambdaSize` had to be raised from `35mb`, which
+predated bundling a decoder and would now fail the build outright.
+
+**One problem remains, and it is architectural.** The three-step flow spans three
+requests, and each may land on a different instance. A job is written to one
+instance's `/tmp` during upload, so `/api/process` can arrive somewhere that has
+never seen it and answer *"This job has expired or no longer exists."* It often
+works — Vercel reuses warm instances — but "often" is not "works". Fixing it
+properly means a single-request conversion endpoint that uploads, converts and
+returns the archive in one call, at the cost of the preview grid.
+
+Also worth knowing:
+
+- **Video-site links are off** (`ALLOW_MEDIA_SITE_URLS=false`). Not a Vercel
+  quirk: every cloud IP is a datacenter IP, and video sites challenge those.
+- **The invocation timeout binds.** 10 s on Hobby, 60 s on Pro — a large batch
+  will exceed it long before the output limits do.
 
 #### Paths must not depend on the working directory
 
@@ -468,9 +502,7 @@ was conspicuously fine.
 
 `Settings` now drops blank values before validation (`_blank_means_unset`), so a
 blank variable means "not configured" and the default applies. A real value
-still overrides, and it makes the documented *"leave empty to resolve from
-PATH"* true for `FFMPEG_PATH` / `FFPROBE_PATH`, where `""` would otherwise be an
-unresolvable path rather than a fallback.
+still overrides.
 
 #### Other serverless caveats
 

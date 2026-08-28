@@ -1,0 +1,9 @@
+# Everything, for local work and for running the test suite.
+-r requirements.txt
+-r requirements-extra.txt
+
+# uvloop/httptools/watchfiles: faster locally, ~26 MB, unwanted in a bundle.
+uvicorn[standard]==0.34.0
+
+pytest==8.3.4
+httpx==0.28.1

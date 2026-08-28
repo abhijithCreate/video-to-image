@@ -57,14 +57,20 @@ def test_asset_versioning_still_works_from_a_foreign_directory(tmp_path, monkeyp
     assert "?v=" in asset_url("js/app.js")
 
 
-def test_missing_ffmpeg_is_reported_as_a_clean_error_not_a_crash(
+def test_a_missing_decoder_is_reported_as_a_clean_error_not_a_crash(
     client, monkeypatch, tmp_path
 ):
-    """Vercel's Python runtime ships no FFmpeg, so this is its normal state."""
-    from app.config import settings
+    """The decoder ships in a wheel now, so this only happens on a broken
+    install - but it must still be a 400, not a stack trace."""
+    from app.services import video as video_service
 
-    monkeypatch.setattr(settings, "ffmpeg_path", str(tmp_path / "no-ffmpeg"))
-    monkeypatch.setattr(settings, "ffprobe_path", str(tmp_path / "no-ffprobe"))
+    def no_decoder():
+        raise video_service.VideoError(
+            "Video processing is unavailable on this server (no video decoder)."
+        )
+
+    monkeypatch.setattr(video_service, "_av", no_decoder)
+    monkeypatch.setattr(video_service, "ffmpeg_available", lambda: False)
 
     assert client.get("/health").json()["ffmpeg"] is False
 
@@ -76,15 +82,15 @@ def test_missing_ffmpeg_is_reported_as_a_clean_error_not_a_crash(
         )
 
     assert response.status_code == 400
-    assert "FFmpeg not found" in response.json()["error"]
+    assert "unavailable on this server" in response.json()["error"]
 
 
 @pytest.mark.parametrize("path", ["/", "/health"])
-def test_the_page_still_serves_without_ffmpeg(client, monkeypatch, tmp_path, path):
+def test_the_page_still_serves_without_a_decoder(client, monkeypatch, path):
     """The UI must load even where video processing cannot run."""
-    from app.config import settings
+    from app.services import video as video_service
 
-    monkeypatch.setattr(settings, "ffmpeg_path", str(tmp_path / "no-ffmpeg"))
+    monkeypatch.setattr(video_service, "ffmpeg_available", lambda: False)
     assert client.get(path).status_code == 200
 
 
@@ -188,18 +194,6 @@ def test_a_real_value_still_overrides_the_default(monkeypatch):
     assert settings.allow_media_site_urls is False
 
 
-def test_blank_binary_paths_fall_back_to_a_resolvable_default(monkeypatch):
-    """.env.example says "leave empty to resolve from PATH"; an empty string is
-    not resolvable, so blank has to mean the default."""
-    from app.config import Settings
-
-    monkeypatch.setenv("FFMPEG_PATH", "")
-    monkeypatch.setenv("FFPROBE_PATH", "")
-    settings = Settings()
-    assert settings.ffmpeg_path == "ffmpeg"
-    assert settings.ffprobe_path == "ffprobe"
-
-
 def test_the_whole_app_survives_a_blank_vercel_style_environment(
     tmp_path, monkeypatch
 ):
@@ -288,3 +282,83 @@ def test_deploy_configs_disable_video_site_links():
 
     vercel = json.loads(Path("vercel.json").read_text())
     assert vercel["env"]["ALLOW_MEDIA_SITE_URLS"] == "false"
+
+
+def test_the_page_offers_no_upload_where_processing_cannot_work(
+    client, monkeypatch
+):
+    """Inviting an upload that is guaranteed to fail is worse than saying so."""
+    from app.services import video as video_service
+
+    monkeypatch.setattr(video_service, "ffmpeg_available", lambda: False)
+
+    body = client.get("/").text
+    assert "Video processing is unavailable on this server" in body
+    assert "docker compose up --build" in body
+    # The controls are inert rather than merely styled as such.
+    assert "disabled" in body.split('id="file-input"')[1][:250]
+    # The URL field needs ffprobe to verify what arrives, so it goes too.
+    assert 'id="url-form"' not in body
+
+
+def test_the_upload_form_is_untouched_where_ffmpeg_is_present(client, monkeypatch):
+    """Simulated rather than assumed: this suite also runs where FFmpeg is
+    absent, which is exactly the state the previous test covers."""
+    from app.services import video as video_service
+
+    monkeypatch.setattr(video_service, "ffmpeg_available", lambda: True)
+
+    body = client.get("/").text
+    assert "Video processing is unavailable on this server" not in body
+    assert "disabled" not in body.split('id="file-input"')[1][:250]
+    assert 'id="url-form"' in body
+
+
+# ---------- decoding without a binary ----------
+
+
+def test_the_app_shells_out_to_no_video_binary():
+    """Decoding runs in-process. A subprocess call would reintroduce the exact
+    dependency that made serverless hosting impossible."""
+    source = Path("app/services/video.py").read_text()
+    # Checked against the parsed module, not the prose: the docstring explains
+    # why the subprocess went away and would match a naive grep.
+    import ast
+
+    tree = ast.parse(source)
+    imported = {
+        alias.name.split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {
+        node.module.split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+    assert "subprocess" not in imported
+    assert "shutil" not in imported
+    # PyAV is imported lazily inside helpers, so look for the call sites.
+    assert "import av" in source
+
+
+def test_the_production_dependency_set_stays_lean():
+    """A serverless bundle is capped at 250 MB unzipped; the production set
+    measures ~142 MB, and these are the entries that would blow it."""
+    prod = Path("requirements.txt").read_text()
+    assert "av==" in prod
+    for excluded in ("yt-dlp", "pytest", "httpx", "numpy", "uvicorn[standard]"):
+        assert excluded not in prod, f"{excluded} belongs in requirements-dev.txt"
+
+    dev = Path("requirements-dev.txt").read_text()
+    assert "-r requirements.txt" in dev
+    for expected in ("pytest", "httpx", "uvicorn[standard]"):
+        assert expected in dev
+
+
+def test_the_bundle_cap_allows_the_decoder():
+    """35mb predated bundling a decoder and would fail the build outright."""
+    import json
+
+    config = json.loads(Path("vercel.json").read_text())
+    assert config["builds"][0]["config"]["maxLambdaSize"] == "250mb"

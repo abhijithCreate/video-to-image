@@ -88,8 +88,7 @@ class Settings(BaseSettings):
     youtube_cookies_file: Path | None = None
     youtube_cookies_from_browser: str = ""
 
-    ffmpeg_path: str = "ffmpeg"
-    ffprobe_path: str = "ffprobe"
+    # Wall-clock ceiling for decoding one job.
     process_timeout_seconds: int = 600
 
     # Longest edge of a grid thumbnail, in pixels.

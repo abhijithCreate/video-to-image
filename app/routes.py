@@ -122,6 +122,9 @@ async def index(request: Request) -> HTMLResponse:
             "asset": asset_url,
             "allow_url_uploads": settings.allow_url_uploads,
             "allow_media_site_urls": media_site_service.enabled(),
+            # No FFmpeg means no conversion is possible on this host. Say so up
+            # front rather than letting someone upload and hit an error.
+            "processing_available": video_service.ffmpeg_available(),
             "accepted_labels": sorted(
                 ext.lstrip(".").upper() for ext in ALLOWED_VIDEO_EXTENSIONS
             ),

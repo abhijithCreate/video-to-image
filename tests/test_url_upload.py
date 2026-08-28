@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import http.server
+import shutil
 import subprocess
 import threading
 import pytest
@@ -10,8 +11,12 @@ import pytest
 from app.config import settings
 from app.services import download, video as video_service
 
+# The app decodes in-process via PyAV and needs no binary. These fixtures still
+# shell out to the ffmpeg CLI to *synthesise* a test clip, which is a tooling
+# dependency, not an application one - so this checks for the binary directly.
 needs_ffmpeg = pytest.mark.skipif(
-    not video_service.ffmpeg_available(), reason="FFmpeg is not installed"
+    shutil.which("ffmpeg") is None,
+    reason="the ffmpeg CLI is needed to build test videos",
 )
 
 
@@ -19,10 +24,10 @@ needs_ffmpeg = pytest.mark.skipif(
 def media_server(tmp_path):
     """A local HTTP server that serves one real video, plus a few edge cases."""
     video = tmp_path / "clip.mp4"
-    if video_service.ffmpeg_available():
+    if shutil.which("ffmpeg") is not None:
         subprocess.run(
             [
-                settings.ffmpeg_path, "-nostdin", "-hide_banner", "-loglevel", "error",
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
                 "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=10:duration=2",
                 "-pix_fmt", "yuv420p", str(video),
             ],

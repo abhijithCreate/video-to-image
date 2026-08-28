@@ -1,14 +1,14 @@
+# Production runtime. Deliberately minimal: a serverless bundle is capped at
+# 250 MB unzipped, and this is what such a host installs.
 fastapi==0.115.6
-uvicorn[standard]==0.34.0
+uvicorn==0.34.0
 jinja2==3.1.5
 python-multipart==0.0.20
 pydantic==2.10.5
 pydantic-settings==2.7.1
 pillow==11.1.0
-# Resolves video-site pages (YouTube and similar) to a downloadable stream.
-# Extractors break when sites change, so this needs bumping periodically.
-yt-dlp==2026.8.19
 
-# development / tests
-pytest==8.3.4
-httpx==0.28.1
+# Decoding runs in-process: PyAV bundles libavformat/libavcodec/libavfilter in
+# its wheel, so no ffmpeg binary needs to exist on the host. This is what lets
+# the app run somewhere it cannot install system packages.
+av==18.1.0

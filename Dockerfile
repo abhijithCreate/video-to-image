@@ -6,15 +6,18 @@ ENV PYTHONUNBUFFERED=1 \
     TEMP_DIR=/tmp/video-to-image \
     PORT=8000
 
-# FFmpeg provides both ffmpeg and ffprobe.
+# The application does NOT need this: decoding runs in-process through PyAV.
+# It is here only so the test suite can synthesise sample videos with the CLI.
+# Drop it for a slimmer production image; the app is unaffected.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv/app
 
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# The full set: this image both runs the app and runs its test suite.
+COPY requirements.txt requirements-extra.txt requirements-dev.txt ./
+RUN pip install --no-cache-dir -r requirements-dev.txt
 
 COPY app ./app
 COPY templates ./templates

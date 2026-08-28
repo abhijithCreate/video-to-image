@@ -1,17 +1,20 @@
-"""FFmpeg / ffprobe integration: metadata and frame extraction.
+"""Video metadata and frame extraction, via FFmpeg's libraries in-process.
 
-Subprocesses are always invoked with an argument list (never ``shell=True``) and
-always under a wall-clock timeout.
+Decoding goes through PyAV, which binds libavformat/libavcodec/libavfilter
+directly and ships them inside its wheel. That replaced shelling out to an
+``ffmpeg`` binary, for one decisive reason: a serverless Python runtime has no
+FFmpeg on PATH and no way to install one, so the subprocess approach could not
+run there at all. A wheel is just a dependency.
+
+It is also less machinery - no argument lists, no stderr pipe to drain, no
+process to reap - and the filter graph is the same libavfilter the CLI drives,
+so ``fps=`` and ``scale=`` behave as before.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import math
-import shutil
-import subprocess
-import tempfile
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, asdict
@@ -21,9 +24,9 @@ from app.config import settings
 
 logger = logging.getLogger("video_to_image.video")
 
-# Frames leave FFmpeg as raw RGBA and go straight into Pillow, so no intermediate
-# images are ever written to disk. Alpha is kept; Pillow flattens it when the
-# chosen output format cannot store it.
+# Frames come out of the decoder as raw RGBA and go straight into Pillow, so no
+# intermediate images are ever written to disk. Alpha is kept; Pillow flattens it
+# when the chosen output format cannot store it.
 BYTES_PER_PIXEL = 4
 PIXEL_FORMAT = "rgba"
 
@@ -58,30 +61,49 @@ class ExtractionPlan:
     truncated: bool  # True when a safety limit reduced the request
 
 
-def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+def _av():
+    """Import PyAV lazily so a broken install degrades instead of crashing."""
     try:
-        return subprocess.run(  # noqa: S603 - fixed binary, list args, no shell
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=settings.process_timeout_seconds,
-            check=False,
-        )
-    except FileNotFoundError as exc:  # pragma: no cover - environment dependent
+        import av
+    except ImportError as exc:  # pragma: no cover - depends on the install
         raise VideoError(
-            "Video processing is unavailable on this server (FFmpeg not found)."
+            "Video processing is unavailable on this server (no video decoder)."
         ) from exc
-    except subprocess.TimeoutExpired as exc:
-        raise VideoError(
-            "Processing took too long and was stopped. Try a shorter video or fewer images."
-        ) from exc
+    return av
+
+
+def _open(source: Path):
+    """Open a container, mapping any decoder error to a user-facing one."""
+    av = _av()
+    try:
+        return av.open(str(source))
+    except VideoError:
+        raise
+    except Exception as exc:  # PyAV raises a family of FFmpegError subclasses
+        raise VideoError("This file could not be read as a video.") from exc
+
+
+def _video_stream(container):
+    stream = next((s for s in container.streams if s.type == "video"), None)
+    if stream is None:
+        raise VideoError("No video stream was found in this file.")
+    # Let libav use threads; this is the whole decode budget on a small host.
+    stream.thread_type = "AUTO"
+    return stream
 
 
 def ffmpeg_available() -> bool:
-    """True when both binaries can be resolved."""
-    return bool(
-        shutil.which(settings.ffmpeg_path) and shutil.which(settings.ffprobe_path)
-    )
+    """True when a decoder is present, i.e. PyAV imported.
+
+    Named for the feature rather than the mechanism: /health, the page template
+    and the tests all ask the same question - can this host convert a video? The
+    answer used to depend on binaries on PATH and now depends on a wheel.
+    """
+    try:
+        import av  # noqa: F401
+    except ImportError:  # pragma: no cover - depends on the install
+        return False
+    return True
 
 
 # FFmpeg reports one demuxer name for a whole container family, so an MP4 comes
@@ -174,60 +196,33 @@ def _parse_fps(rate: str | None) -> float:
 
 def probe(path: Path, *, original_filename: str | None = None) -> VideoInfo:
     """Read metadata from a media file, verifying it contains a video stream."""
-    result = _run(
-        [
-            settings.ffprobe_path,
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-            str(path),
-        ]
-    )
-    if result.returncode != 0:
-        raise VideoError("This file could not be read as a video.")
+    with _open(path) as container:
+        stream = _video_stream(container)
+        codec = stream.codec_context
 
-    try:
-        data = json.loads(result.stdout or "{}")
-    except json.JSONDecodeError as exc:
-        raise VideoError("This file could not be read as a video.") from exc
+        # Container duration is authoritative; a stream's own is the fallback.
+        duration = 0.0
+        av = _av()
+        if container.duration:
+            duration = float(container.duration) / av.time_base
+        elif stream.duration and stream.time_base:
+            duration = float(stream.duration * stream.time_base)
 
-    streams = data.get("streams") or []
-    video_stream = next(
-        (s for s in streams if s.get("codec_type") == "video"), None
-    )
-    if video_stream is None:
-        raise VideoError("No video stream was found in this file.")
+        rate = stream.average_rate or stream.base_rate or 0
+        name = original_filename or path.name
 
-    container = data.get("format") or {}
-    duration = 0.0
-    for candidate in (container.get("duration"), video_stream.get("duration")):
-        try:
-            duration = float(candidate)
-        except (TypeError, ValueError):
-            continue
-        if duration > 0:
-            break
-
-    fps = _parse_fps(video_stream.get("avg_frame_rate")) or _parse_fps(
-        video_stream.get("r_frame_rate")
-    )
-
-    name = original_filename or path.name
-    return VideoInfo(
-        filename=name,
-        size_bytes=path.stat().st_size,
-        duration=round(max(duration, 0.0), 3),
-        width=int(video_stream.get("width") or 0),
-        height=int(video_stream.get("height") or 0),
-        fps=round(fps, 3),
-        format_name=describe_format(
-            container.get("format_name"), name, container.get("tags")
-        ),
-        codec=video_stream.get("codec_name") or "unknown",
-    )
+        return VideoInfo(
+            filename=name,
+            size_bytes=path.stat().st_size,
+            duration=round(max(duration, 0.0), 3),
+            width=int(codec.width or 0),
+            height=int(codec.height or 0),
+            fps=round(float(rate), 3),
+            format_name=describe_format(
+                container.format.name, name, dict(container.metadata or {})
+            ),
+            codec=codec.name or "unknown",
+        )
 
 
 def resolve_plan(
@@ -336,17 +331,61 @@ def _single_frame(plan: ExtractionPlan) -> ExtractionPlan:
     )
 
 
-def _read_exact(stream, size: int) -> bytes:
-    """Read exactly ``size`` bytes, or fewer at the end of the stream."""
-    chunks: list[bytes] = []
-    remaining = size
-    while remaining > 0:
-        chunk = stream.read(remaining)
-        if not chunk:
-            break
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
+def _build_graph(stream, plan: ExtractionPlan, target_size, width: int, height: int):
+    """The same libavfilter chain the CLI would get from ``-vf``.
+
+    ``None`` when nothing needs filtering, so frames go straight from the decoder
+    to Pillow.
+    """
+    if plan.fps is None and target_size is None:
+        return None
+
+    av = _av()
+    graph = av.filter.Graph()
+    last = graph.add_buffer(template=stream)
+    if plan.fps is not None:
+        node = graph.add("fps", f"{plan.fps:.6f}")
+        last.link_to(node)
+        last = node
+    if target_size is not None:
+        node = graph.add("scale", f"{width}:{height}:flags=lanczos")
+        last.link_to(node)
+        last = node
+    last.link_to(graph.add("buffersink"))
+    graph.configure()
+    return graph
+
+
+def _drain(graph):
+    """Pull every frame the graph can currently produce."""
+    av = _av()
+    # EOFError once flushed, BlockingIOError while it still wants input.
+    expected = (av.error.BlockingIOError, av.error.EOFError, av.error.FFmpegError)
+    while True:
+        try:
+            yield graph.pull()
+        except expected:
+            return
+        except (BlockingIOError, EOFError):  # pragma: no cover - older PyAV
+            return
+
+
+def _rgba_bytes(frame, width: int, height: int) -> bytes:
+    """Packed RGBA for one frame, with libav's row padding removed.
+
+    Each row is aligned, so a plane's buffer can be wider than the picture: a
+    1921px frame carries a 7696-byte stride for 7684 bytes of pixels. Pillow
+    wants the rows packed, so a padded plane is stitched row by row. PyAV's
+    ``to_ndarray`` would do the same thing at the cost of depending on numpy,
+    which installs to 61 MB - most of a serverless bundle's budget.
+    """
+    plane = frame.reformat(format=PIXEL_FORMAT, width=width, height=height).planes[0]
+    row = width * BYTES_PER_PIXEL
+    stride = plane.line_size
+    view = memoryview(plane)
+    if stride == row:
+        return view.tobytes()
+    return b"".join(view[i * stride : i * stride + row] for i in range(height))
 
 
 def stream_frames(
@@ -358,90 +397,68 @@ def stream_frames(
 ) -> Iterator[tuple[int, float, bytes]]:
     """Yield ``(index, timestamp, rgba_bytes)`` for each extracted frame.
 
-    Frames are piped from FFmpeg one at a time rather than written out as files:
-    peak disk usage is zero and peak memory is a single frame, which is what
-    makes a 500-image limit safe even at high resolutions. Scaling is done by
-    FFmpeg so only the final size is ever decoded.
+    Frames are decoded one at a time rather than written out as files: peak disk
+    usage is zero and peak memory is a single frame, which is what makes a
+    500-image limit safe even at high resolutions. Scaling happens in the filter
+    graph, so only the final size is ever converted to RGBA.
     """
     width, height = target_size or source_size
     if width <= 0 or height <= 0:
         raise VideoError("This video has no usable picture dimensions.")
-    frame_bytes = width * height * BYTES_PER_PIXEL
-
-    filters: list[str] = []
-    if plan.fps is not None:
-        filters.append(f"fps={plan.fps:.6f}")
-    if target_size is not None:
-        filters.append(f"scale={width}:{height}:flags=lanczos")
-
-    cmd = [
-        settings.ffmpeg_path,
-        "-nostdin",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-i",
-        str(source),
-    ]
-    if filters:
-        cmd += ["-vf", ",".join(filters)]
-    cmd += [
-        "-an",
-        "-sn",
-        "-frames:v",
-        str(plan.count),
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        PIXEL_FORMAT,
-        "-",
-    ]
 
     deadline = time.monotonic() + settings.process_timeout_seconds
-    # A real file for stderr: a pipe we are not draining could deadlock FFmpeg.
-    with tempfile.TemporaryFile() as errors:
-        try:
-            process = subprocess.Popen(  # noqa: S603 - fixed binary, list args, no shell
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=errors,
-                stdin=subprocess.DEVNULL,
-            )
-        except FileNotFoundError as exc:  # pragma: no cover - environment dependent
-            raise VideoError(
-                "Video processing is unavailable on this server (FFmpeg not found)."
-            ) from exc
+    emitted = 0
 
-        emitted = 0
+    with _open(source) as container:
+        stream = _video_stream(container)
+        graph = _build_graph(stream, plan, target_size, width, height)
+
+        def emit(frame):
+            nonlocal emitted
+            data = _rgba_bytes(frame, width, height)
+            index = emitted + 1
+            emitted = index
+            return index, round((index - 1) * plan.interval, 3), data
+
         try:
-            while emitted < plan.count:
+            for decoded in container.decode(stream):
                 if time.monotonic() > deadline:
                     raise VideoError(
                         "Processing took too long and was stopped. "
                         "Try a shorter video or fewer images."
                     )
-                data = _read_exact(process.stdout, frame_bytes)
-                if len(data) < frame_bytes:
-                    break
-                yield emitted + 1, round(emitted * plan.interval, 3), data
-                emitted += 1
-        finally:
-            if process.stdout is not None:
-                process.stdout.close()
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:  # pragma: no cover - stuck ffmpeg
-                    process.kill()
-                    process.wait()
+                if graph is None:
+                    yield emit(decoded)
+                    if emitted >= plan.count:
+                        return
+                    continue
 
-        if emitted == 0:
-            errors.seek(0)
-            detail = errors.read().decode("utf-8", "replace").strip()
-            if detail:
-                logger.warning("FFmpeg produced no frames: %s", detail[:500])
-            raise VideoError("No frames could be extracted from this video.")
+                graph.push(decoded)
+                for filtered in _drain(graph):
+                    yield emit(filtered)
+                    if emitted >= plan.count:
+                        return
+
+            # Flush: the fps filter can be holding the last frame back.
+            if graph is not None and emitted < plan.count:
+                try:
+                    graph.push(None)
+                except Exception:  # pragma: no cover - nothing buffered
+                    pass
+                for filtered in _drain(graph):
+                    yield emit(filtered)
+                    if emitted >= plan.count:
+                        return
+        except VideoError:
+            raise
+        except Exception as exc:  # a truncated or corrupt file surfaces here
+            if emitted == 0:
+                logger.warning("Decoding failed: %s", str(exc)[:500])
+                raise VideoError("No frames could be extracted from this video.") from exc
+            # Partial output is still usable; stop where the file stops.
+
+    if emitted == 0:
+        raise VideoError("No frames could be extracted from this video.")
 
 
 def frame_size(
