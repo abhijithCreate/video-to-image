@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -93,6 +95,55 @@ def test_result_is_destroyed_after_too_many_clients():
 
     with pytest.raises(jobs.JobError):
         jobs.register_download(job_id, "198.51.100.250")
+    assert not directory.exists()
+
+
+def test_concurrent_downloads_keep_the_job_readable():
+    """Two downloads landing together must not corrupt job.json.
+
+    They used to share one "job.json.part" temp file: their writes interleaved
+    into unreadable JSON, and the second rename raised FileNotFoundError, so the
+    request 500ed and every later request called the job expired. The lightbox
+    makes this the normal case - it loads an image while the grid is still
+    fetching - which showed up as previews going missing part-way down the grid.
+    """
+    job_id, directory = jobs.create()
+    jobs.write_meta(job_id, {"job_id": job_id, "images": []})
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        errors = [
+            future.exception()
+            for future in [
+                pool.submit(jobs.register_download, job_id, "203.0.113.9")
+                for _ in range(24)
+            ]
+        ]
+    assert errors == [None] * 24
+
+    meta = json.loads((directory / "job.json").read_text(encoding="utf-8"))
+    # One client, counted once, and nothing left behind by the atomic write.
+    assert len(meta["clients"]) == 1
+    assert not list(directory.glob("*.part"))
+    assert directory.exists()
+
+
+def test_concurrent_downloads_still_enforce_the_client_limit():
+    """The limit has to survive the race that the lock closes."""
+    job_id, directory = jobs.create()
+    jobs.write_meta(job_id, {"job_id": job_id, "images": []})
+
+    clients = [f"192.0.2.{index}" for index in range(settings.max_download_clients + 4)]
+    with ThreadPoolExecutor(max_workers=len(clients)) as pool:
+        results = [
+            future.exception()
+            for future in [
+                pool.submit(jobs.register_download, job_id, client)
+                for client in clients
+            ]
+        ]
+
+    refused = [error for error in results if isinstance(error, jobs.JobError)]
+    assert refused, "a client beyond the limit should have been refused"
     assert not directory.exists()
 
 

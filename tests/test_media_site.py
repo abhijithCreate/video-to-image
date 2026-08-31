@@ -344,8 +344,32 @@ def test_a_bot_check_is_retried_with_a_fallback_client(monkeypatch, tmp_path):
 
     path, display = media_site.fetch(url="https://youtu.be/abc", directory=tmp_path)
 
-    assert tried == [None, *media_site.CLIENT_FALLBACKS]
+    # Stops at the first fallback that works rather than walking the whole list.
+    assert tried == [None, media_site.CLIENT_FALLBACKS[0]]
     assert (path.name, display) == ("input.mp4", "Clip.mp4")
+
+
+def test_each_fallback_client_is_tried_before_giving_up(monkeypatch, tmp_path):
+    """One endpoint being challenged says nothing about the next.
+
+    Every client in the list talks to a different endpoint, so a challenge is
+    only final once all of them have been asked.
+    """
+    tried: list[str | None] = []
+    last = media_site.CLIENT_FALLBACKS[-1]
+
+    def fake_once(url, directory, client):
+        tried.append(client)
+        if client != last:
+            raise media_site.Challenged("prove it is not a bot")
+        target = directory / "input.mp4"
+        target.write_bytes(b"0" * 32)
+        return target, "Clip.mp4"
+
+    monkeypatch.setattr(media_site, "_fetch_once", fake_once)
+    media_site.fetch(url="https://youtu.be/abc", directory=tmp_path)
+
+    assert tried == [None, *media_site.CLIENT_FALLBACKS]
 
 
 def test_a_final_failure_is_not_retried(monkeypatch, tmp_path):
@@ -377,8 +401,11 @@ def test_the_bot_check_surfaces_once_every_client_is_exhausted(monkeypatch, tmp_
 
 
 def test_only_clients_that_can_finish_a_download_are_used():
-    """android_vr extracts fine and then 403s on the media URLs."""
-    assert "android_vr" not in media_site.CLIENT_FALLBACKS
+    """These extract fine and then fail on the media URLs, or yield no usable
+    format at all - trying them costs a round-trip and provokes the site for
+    nothing."""
+    for client in ("android_vr", "tv", "ios", "mweb", "web_embedded"):
+        assert client not in media_site.CLIENT_FALLBACKS
     assert media_site.CLIENT_FALLBACKS
 
 

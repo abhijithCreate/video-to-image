@@ -6,7 +6,10 @@
 
   var state = {
     jobId: null, images: [], objectUrl: null, blobUrl: null, file: null, busy: false,
-    step: 'upload', hasResults: false
+    step: 'upload', hasResults: false,
+    // Previews that failed every recovery attempt, and the notice text the
+    // result itself asked for, so the two can share one banner.
+    missingPreviews: 0, truncatedNotice: ''
   };
 
   /* Where consecutive requests are not guaranteed to reach the same instance,
@@ -700,9 +703,13 @@
     $('download-zip').href = result.download_all_url;
 
     var notice = $('results-notice');
-    if (result.truncated) {
-      notice.textContent = 'Your request exceeded the limit of ' + result.limit +
-        ' images, so extraction stopped there.';
+    state.missingPreviews = 0;
+    state.truncatedNotice = result.truncated
+      ? 'Your request exceeded the limit of ' + result.limit +
+        ' images, so extraction stopped there.'
+      : '';
+    if (state.truncatedNotice) {
+      notice.textContent = state.truncatedNotice;
       show(notice);
     } else {
       hide(notice);
@@ -737,6 +744,8 @@
         ' class="group block w-full overflow-hidden rounded-xl border border-slate-200 bg-white text-left transition hover:border-brand-500 hover:shadow-md focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 dark:border-slate-800 dark:bg-slate-900">' +
         '<img src="' + escapeAttr(image.thumbnail_url) + '" alt="' + escapeAttr(label) + '"' +
         ' loading="lazy" decoding="async"' +
+        ' data-thumb="' + escapeAttr(image.thumbnail_url) + '"' +
+        ' data-full="' + escapeAttr(image.url) + '"' +
         ' class="aspect-video w-full bg-slate-100 object-cover dark:bg-slate-800">' +
         '<span class="flex items-baseline justify-between gap-2 px-3 py-2 text-xs">' +
         '<span class="font-medium">Frame ' + image.frame + '</span>' +
@@ -749,6 +758,78 @@
     announce(state.images.length + ' images generated.');
   }
 
+  /* A thumbnail that fails to load would otherwise sit there as a broken-image
+     icon for the rest of the session: nothing ever retries it. A single dropped
+     request is enough - a connection reset, a load the browser cancelled while
+     the grid was still painting - and it looks like the conversion skipped a
+     frame, which it did not.
+
+     So each tile gets three chances: the thumbnail again (cache-busted, since a
+     failed response can itself be cached), then the full-size image, and only
+     then a labelled placeholder that keeps the grid's shape. Error events do not
+     bubble, so this listens in the capture phase on the grid, which survives the
+     innerHTML rebuild that replaces the images themselves. */
+
+  var THUMB_RETRY_DELAY_MS = 400;
+
+  function recoverThumbnail(img) {
+    var stage = img.getAttribute('data-retry') || '';
+
+    if (stage === '') {
+      img.setAttribute('data-retry', 'retried');
+      window.setTimeout(function () {
+        img.src = img.getAttribute('data-thumb') + '?retry=' + Date.now();
+      }, THUMB_RETRY_DELAY_MS);
+      return;
+    }
+
+    if (stage === 'retried' && img.getAttribute('data-full')) {
+      // The preview is gone but the image behind it may not be. It is heavier
+      // than a thumbnail, which is why it is the fallback and not the source.
+      img.setAttribute('data-retry', 'full');
+      img.src = img.getAttribute('data-full');
+      return;
+    }
+
+    replaceWithPlaceholder(img);
+  }
+
+  function replaceWithPlaceholder(img) {
+    var placeholder = document.createElement('span');
+    placeholder.className = 'flex aspect-video w-full items-center justify-center ' +
+      'bg-slate-100 px-2 text-center text-xs text-slate-500 ' +
+      'dark:bg-slate-800 dark:text-slate-400';
+    placeholder.textContent = 'Preview unavailable';
+    placeholder.setAttribute('role', 'img');
+    placeholder.setAttribute('aria-label', img.alt + ' - preview unavailable');
+    img.replaceWith(placeholder);
+    state.missingPreviews += 1;
+    reportMissingPreviews();
+  }
+
+  /* One message for the lot, rather than the user counting gaps in the grid.
+     A result that has expired or been removed loses every preview at once, and
+     that is worth saying plainly - the images themselves are gone too. */
+  function reportMissingPreviews() {
+    if (!state.missingPreviews) return;
+    var total = state.images.length;
+    var message = state.missingPreviews >= total
+      ? 'The previews could not be loaded. This result may have expired or been ' +
+        'removed \u2014 convert the video again to get it back.'
+      : state.missingPreviews + ' of ' + total + ' previews could not be loaded. ' +
+        'The images themselves may still download.';
+    var notice = $('results-notice');
+    notice.textContent = state.truncatedNotice
+      ? state.truncatedNotice + ' ' + message
+      : message;
+    show(notice);
+  }
+
+  $('results-grid').addEventListener('error', function (event) {
+    var img = event.target;
+    if (img && img.tagName === 'IMG') recoverThumbnail(img);
+  }, true);
+
   $('start-over').addEventListener('click', async function () {
     if (state.jobId) {
       try {
@@ -758,6 +839,8 @@
     state.jobId = null;
     state.images = [];
     state.file = null;
+    state.missingPreviews = 0;
+    state.truncatedNotice = '';
     if (state.blobUrl) {
       URL.revokeObjectURL(state.blobUrl);
       state.blobUrl = null;

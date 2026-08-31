@@ -14,6 +14,7 @@ direct links; the feature reports itself as unavailable instead.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import tempfile
@@ -23,6 +24,8 @@ from pathlib import Path
 from typing import Any
 
 from app.config import ALLOWED_VIDEO_EXTENSIONS, settings
+
+logger = logging.getLogger("video_to_image.media_site")
 
 
 class MediaSiteError(Exception):
@@ -101,14 +104,19 @@ _ERROR_HINTS: tuple[tuple[str, str], ...] = (
 
 _GENERIC_ERROR = "That link could not be read as a video."
 
-# YouTube challenges the default (web) client by IP, especially from datacenters
-# and after a burst of requests. The android client talks to a different endpoint
-# and still serves a complete progressive stream when the default is blocked, so
-# it is worth one retry. Quality is lower - a working 360p beats nothing.
+# YouTube challenges the default client by IP, especially from datacenters and
+# after a burst of requests. Each of these talks to a different endpoint, so one
+# being challenged says little about the next.
 #
-# Only clients verified to finish a *download* belong here: android_vr extracts
-# happily and then 403s on the media URLs, which is worse than not trying.
-CLIENT_FALLBACKS: tuple[str, ...] = ("android",)
+# Only clients verified to finish a *download* belong here, and they are ordered
+# by the quality they return:
+#   tv_embedded - the same streams as the default client, so nothing is lost
+#   android     - a lower-resolution progressive stream, but it completes
+#
+# Deliberately absent: android_vr and tv extract and then fail on the media URLs,
+# and ios/mweb/web_embedded return only formats the selector cannot use. Trying
+# them costs a round-trip and provokes the site for nothing.
+CLIENT_FALLBACKS: tuple[str, ...] = ("tv_embedded", "android")
 
 # Wording YouTube uses when it wants a signed-in or attested client.
 _CHALLENGE_SIGNS: tuple[str, ...] = (
@@ -423,4 +431,30 @@ def fetch(*, url: str, directory: Path) -> tuple[Path, str]:
             challenge = exc
 
     _clear(directory)
-    raise challenge if challenge else MediaSiteError(_GENERIC_ERROR)
+    if challenge is not None:
+        _log_challenge(url)
+        raise challenge
+    raise MediaSiteError(_GENERIC_ERROR)
+
+
+def _log_challenge(url: str) -> None:
+    """Say in the log what the browser deliberately is not told.
+
+    The user-facing message stays generic - an end user cannot act on server
+    configuration - but the operator reading the log can, and the remedy is a
+    setting they may not know exists.
+    """
+    host = urllib.parse.urlsplit(url).hostname or "the site"
+    if cookies_configured():
+        logger.warning(
+            "%s challenged every player client despite configured credentials; "
+            "the cookie jar may have expired.",
+            host,
+        )
+        return
+    logger.warning(
+        "%s challenged every player client and no credentials are configured. "
+        "Set YOUTUBE_COOKIES_FILE, YOUTUBE_COOKIES or YOUTUBE_COOKIES_FROM_BROWSER "
+        "to get past a persistent bot check.",
+        host,
+    )

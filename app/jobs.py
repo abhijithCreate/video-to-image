@@ -18,8 +18,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
+import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -31,6 +34,12 @@ SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 META_FILENAME = "job.json"
 ARCHIVE_FILENAME = "images.zip"
+
+# Serialises the read-modify-write in register_download. Two downloads arriving
+# together - which is the normal case, since the lightbox loads an image while
+# the grid is still fetching thumbnails - would otherwise both read the same
+# client list and one update would be lost.
+_meta_lock = threading.Lock()
 
 
 class JobError(Exception):
@@ -61,10 +70,25 @@ def directory(job_id: str) -> Path:
 
 
 def write_meta(job_id: str, meta: dict) -> None:
+    """Publish job metadata atomically.
+
+    The temp file has to be unique per writer, not a fixed "job.json.part". Two
+    requests writing at once shared that one name: they interleaved their
+    writes, so the file that got published was a splice of both - unreadable
+    JSON, after which every later request for the job reported it as expired -
+    and whichever of them renamed second raised FileNotFoundError, surfacing as
+    a 500. mkstemp in the job's own directory keeps the rename atomic while
+    giving each writer its own file.
+    """
     path = directory(job_id) / META_FILENAME
-    tmp = path.with_suffix(".json.part")
-    tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    handle, name = tempfile.mkstemp(dir=path.parent, prefix=".job-", suffix=".part")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(meta, stream, indent=2)
+        os.replace(name, path)
+    except BaseException:
+        Path(name).unlink(missing_ok=True)
+        raise
 
 
 def read_meta(job_id: str) -> dict:
@@ -128,21 +152,25 @@ def register_download(job_id: str, client: str | None) -> None:
     This is what makes the "removed sooner if accessed from several addresses"
     promise real: a result URL that gets shared around stops working.
     """
-    meta = read_meta(job_id)
     token = _client_token(job_id, client)
-    seen = meta.get("clients") or []
-    if token in seen:
-        return
+    # Held across the read and the write: concurrent downloads from one client
+    # used to each read an empty list and write their own, which both lost
+    # updates and let a single client be counted more than once.
+    with _meta_lock:
+        meta = read_meta(job_id)
+        seen = meta.get("clients") or []
+        if token in seen:
+            return
 
-    if len(seen) >= settings.max_download_clients:
-        delete(job_id)
-        raise JobError(
-            "This result was removed because it was downloaded from too many "
-            "different addresses. Please convert the video again."
-        )
+        if len(seen) >= settings.max_download_clients:
+            delete(job_id)
+            raise JobError(
+                "This result was removed because it was downloaded from too many "
+                "different addresses. Please convert the video again."
+            )
 
-    meta["clients"] = seen + [token]
-    write_meta(job_id, meta)
+        meta["clients"] = seen + [token]
+        write_meta(job_id, meta)
 
 
 def delete(job_id: str) -> None:

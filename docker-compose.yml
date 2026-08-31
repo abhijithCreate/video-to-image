@@ -15,6 +15,25 @@ services:
       MAX_TOTAL_OUTPUT_MB: ${MAX_TOTAL_OUTPUT_MB:-2048}
       ALLOW_URL_UPLOADS: ${ALLOW_URL_UPLOADS:-true}
       ALLOW_PRIVATE_URL_HOSTS: ${ALLOW_PRIVATE_URL_HOSTS:-false}
+      ALLOW_MEDIA_SITE_URLS: ${ALLOW_MEDIA_SITE_URLS:-true}
+      MEDIA_SITE_MAX_HEIGHT: ${MEDIA_SITE_MAX_HEIGHT:-1080}
+      MEDIA_SITE_TIMEOUT_SECONDS: ${MEDIA_SITE_TIMEOUT_SECONDS:-120}
+      # Credentials for a site that keeps asking this server to prove it is not
+      # a bot. Without one of these there is no way to get past a persistent
+      # challenge from inside the container: .dockerignore keeps .env out of the
+      # image on purpose, so these have to be passed in.
+      #
+      # YOUTUBE_COOKIES carries the contents of a cookies.txt directly. For the
+      # file route, put cookies.txt beside this file and uncomment the mount
+      # below - the path is the one *inside* the container.
+      #
+      # COOKIES_FROM_BROWSER cannot work here: the container has no access to a
+      # browser profile on the host. Export the jar instead.
+      YOUTUBE_COOKIES: ${YOUTUBE_COOKIES:-}
+      YOUTUBE_COOKIES_FILE: ${YOUTUBE_COOKIES_FILE:-}
+    # volumes:
+    #   - ./cookies.txt:/srv/app/cookies.txt:ro
+    # and set YOUTUBE_COOKIES_FILE=/srv/app/cookies.txt
     # Jobs live on the container's own ephemeral layer rather than a tmpfs: a
     # 500-image batch can be several GB, which is too much to hold in RAM.
     # Nothing is persisted - the directory dies with the container, and the
