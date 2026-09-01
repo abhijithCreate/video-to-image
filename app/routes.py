@@ -490,10 +490,38 @@ def _public(meta: dict) -> dict:
     }
 
 
+async def _stateless_source(
+    file: UploadFile | None, url: str, directory: Path
+) -> tuple[Path, str]:
+    """Put the video in ``directory``, from whichever of the two the user gave.
+
+    The stateless flow has no job to carry a fetched video between requests, so
+    a link has to be resolved here rather than at upload time. That means the
+    video is fetched twice for a link - once by /api/upload-url to read its
+    metadata for the options step, and again here - which is the price of
+    holding no state at all.
+    """
+    if file is not None and file.filename:
+        extension = _extension_of(file.filename)
+        source = directory / f"input{extension}"
+        await _receive(file, source)
+        return source, file.filename
+
+    link = (url or "").strip()
+    if not link:
+        raise _bad_request("Choose a video file or paste a link to one.")
+    if not settings.allow_url_uploads:
+        raise _bad_request("Fetching videos from a URL is disabled on this server.")
+    return await run_in_threadpool(
+        download_service.fetch, url=link, directory=directory
+    )
+
+
 @router.post("/api/convert")
 async def convert(
     background: BackgroundTasks,
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(None),
+    url: str = Form(""),
     method: str = Form("fps"),
     fps: float | None = Form(None),
     count: int | None = Form(None),
@@ -514,15 +542,13 @@ async def convert(
     the time a preview or download arrives. This endpoint holds no state: the
     work directory is deleted once the response has been sent.
     """
-    extension = _extension_of(file.filename)
     job_id, directory = await run_in_threadpool(jobs.create)
-    source = directory / f"input{extension}"
 
     try:
-        await _receive(file, source)
+        source, original_name = await _stateless_source(file, url, directory)
 
         def run() -> tuple[Path, str]:
-            info = video_service.probe(source, original_filename=file.filename)
+            info = video_service.probe(source, original_filename=original_name)
             if info.duration > settings.max_video_duration_seconds:
                 raise _bad_request(
                     "This video is longer than the "
@@ -561,6 +587,7 @@ async def convert(
 
         archive, download_name = await run_in_threadpool(run)
     except (
+        download_service.DownloadError,
         video_service.VideoError,
         image_service.ImageError,
         zip_service.ZipError,
@@ -572,7 +599,8 @@ async def convert(
         await run_in_threadpool(jobs.delete, job_id)
         raise
     finally:
-        await file.close()
+        if file is not None:
+            await file.close()
 
     # Runs after the archive has been streamed, so nothing lingers on disk.
     background.add_task(jobs.delete, job_id)

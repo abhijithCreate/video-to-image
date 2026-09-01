@@ -76,9 +76,14 @@ MEDIA_SITE_HOSTS: frozenset[str] = frozenset(
 _ERROR_HINTS: tuple[tuple[str, str], ...] = (
     (
         "sign in to confirm",
-        "That site is asking this server to prove it is not a bot. This is "
-        "usually temporary - wait a minute and try again, or download the video "
-        "yourself and upload the file.",
+        # Deliberately does not promise this is temporary. It clears on its own
+        # from a home connection; from a datacenter IP - which every cloud host
+        # has - it does not, and telling that user to wait sends them round a
+        # loop that cannot end. Credentials are the operator's fix for that, and
+        # the log says so; the browser gets the one route that always works.
+        "That site is asking this server to prove it is not a bot. Trying again "
+        "in a minute may clear it - if it does not, download the video yourself "
+        "and upload the file.",
     ),
     (
         "page needs to be reloaded",

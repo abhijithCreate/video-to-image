@@ -9,6 +9,7 @@ import pytest
 
 from app import jobs
 from app.config import settings
+from app.services import download as download_service
 from app.services import video as video_service
 
 # The app decodes in-process via PyAV and needs no binary. These fixtures still
@@ -656,6 +657,76 @@ def test_convert_enforces_the_duration_limit(client, sample_video, monkeypatch):
         )
     assert response.status_code == 400
     assert "longer than" in response.json()["error"]
+
+
+@needs_ffmpeg
+def test_convert_accepts_a_link_instead_of_a_file(client, sample_video, monkeypatch):
+    """The stateless flow has no job to carry a fetched video between requests.
+
+    A link resolved during the options step is gone by the time the conversion
+    runs, so /api/convert has to be able to fetch it itself. Without this the
+    Generate button had nothing to send and silently did nothing - the URL field
+    was on the page but could never produce a ZIP.
+    """
+    def fake_fetch(*, url, directory):
+        destination = directory / "input.mp4"
+        destination.write_bytes(sample_video.read_bytes())
+        return destination, "Fetched clip.mp4"
+
+    monkeypatch.setattr(download_service, "fetch", fake_fetch)
+
+    response = client.post(
+        "/api/convert",
+        data={
+            "url": "https://example.com/watch?v=abc",
+            "method": "count",
+            "count": "2",
+            "image_format": "jpg",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"] == "application/zip"
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        assert len(archive.namelist()) == 2
+
+
+def test_convert_without_a_file_or_a_link_says_so(client):
+    response = client.post("/api/convert", data={"method": "count", "count": "1"})
+    assert response.status_code == 400
+    assert "file or paste a link" in response.json()["error"]
+
+
+def test_convert_reports_a_failed_fetch_rather_than_a_server_error(
+    client, monkeypatch
+):
+    def fake_fetch(*, url, directory):
+        raise download_service.DownloadError("That link could not be reached.")
+
+    monkeypatch.setattr(download_service, "fetch", fake_fetch)
+
+    response = client.post(
+        "/api/convert",
+        data={"url": "https://example.com/x.mp4", "method": "count", "count": "1"},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"] == "That link could not be reached."
+
+
+@needs_ffmpeg
+def test_convert_by_link_leaves_nothing_on_disk(client, sample_video, monkeypatch):
+    def fake_fetch(*, url, directory):
+        destination = directory / "input.mp4"
+        destination.write_bytes(sample_video.read_bytes())
+        return destination, "Fetched clip.mp4"
+
+    monkeypatch.setattr(download_service, "fetch", fake_fetch)
+    before = sorted(p.name for p in jobs.root().iterdir())
+    client.post(
+        "/api/convert",
+        data={"url": "https://example.com/x.mp4", "method": "count", "count": "1"},
+    )
+    assert sorted(p.name for p in jobs.root().iterdir()) == before
 
 
 def test_stateless_mode_is_advertised_to_the_page_and_health(client, monkeypatch):

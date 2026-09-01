@@ -7,6 +7,9 @@
   var state = {
     jobId: null, images: [], objectUrl: null, blobUrl: null, file: null, busy: false,
     step: 'upload', hasResults: false,
+    // In stateless mode the conversion request has to name its own source, and
+    // a link never becomes a local File - so the link is kept alongside it.
+    sourceUrl: null,
     // Previews that failed every recovery attempt, and the notice text the
     // result itself asked for, so the two can share one banner.
     missingPreviews: 0, truncatedNotice: ''
@@ -210,6 +213,7 @@
 
   function inspectLocally(file) {
     state.file = file;
+    state.sourceUrl = null;
 
     var url = URL.createObjectURL(file);
     var probe = document.createElement('video');
@@ -285,7 +289,10 @@
           signal: controller.signal
         });
         if (!response.ok) throw new Error(await readError(response));
-        // No local file: the preview plays the copy on the server.
+        // No local file: the preview plays the copy on the server, and in
+        // stateless mode the link is what the conversion request will send.
+        state.file = null;
+        state.sourceUrl = value;
         onUploaded(null, await response.json());
       } catch (error) {
         showError(
@@ -584,7 +591,7 @@
   $('options-form').addEventListener('submit', async function (event) {
     event.preventDefault();
     if (state.busy) return;
-    if (STATELESS ? !state.file : !state.jobId) return;
+    if (STATELESS ? !(state.file || state.sourceUrl) : !state.jobId) return;
     clearError();
 
     var payload = collectPayload();
@@ -639,7 +646,13 @@
      server between requests. The archive comes back as the response body. */
   async function convertInOneRequest(payload) {
     var body = new FormData();
-    body.append('file', state.file, state.file.name);
+    if (state.file) {
+      body.append('file', state.file, state.file.name);
+    } else {
+      // Nothing was kept from the fetch that filled in the options step, so the
+      // server resolves the link again as part of this one request.
+      body.append('url', state.sourceUrl);
+    }
     Object.keys(payload).forEach(function (key) {
       if (key === 'job_id' || key === 'zip_only') return;
       var value = payload[key];
@@ -839,6 +852,7 @@
     state.jobId = null;
     state.images = [];
     state.file = null;
+    state.sourceUrl = null;
     state.missingPreviews = 0;
     state.truncatedNotice = '';
     if (state.blobUrl) {

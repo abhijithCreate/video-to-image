@@ -313,39 +313,57 @@ Three caveats worth knowing:
 - **Terms of service.** Downloading videos from YouTube is against its Terms of
   Service. That is a decision for whoever runs this server, not something the
   code can settle.
-- **This does not work from a server.** YouTube challenges clients by IP, and
-  every cloud host — Vercel, Fly, Railway, Render, any VPS — has a datacenter
-  IP. Expect it to work from a home or office connection and to fail on a
-  deployment. The deploy configs therefore ship
-  `ALLOW_MEDIA_SITE_URLS=false`, which removes the field rather than offering
-  something that cannot work. See *When the bot check fires* below.
+- **It will not work from a server without credentials.** YouTube challenges
+  clients by IP, and every cloud host — Vercel, Fly, Railway, Render, any VPS —
+  has a datacenter IP. Expect it to work from a home or office connection and to
+  be challenged on every attempt from a deployment. The deploy configs ship
+  `ALLOW_MEDIA_SITE_URLS=true` because `YOUTUBE_COOKIES` makes it workable
+  there, but that variable is the operator's to set: until it is, a deployed
+  instance offers a field that cannot succeed. Set it, or set
+  `ALLOW_MEDIA_SITE_URLS=false` to take the field off the page. See *When the
+  bot check fires* below.
 - **yt-dlp needs bumping.** Extractors break whenever a site changes its player.
   The pin in `requirements.txt` will go stale; update it when links start
   failing.
 
 #### When the bot check fires
 
-YouTube's *"Sign in to confirm you're not a bot"* is rate-limiting by IP, not a
-permanent block — it typically clears on its own within a minute or two. Three
+YouTube's *"Sign in to confirm you're not a bot"* is rate-limiting by IP. From a
+home or office connection it is not a permanent block and typically clears on
+its own within a minute or two. **From a datacenter IP it does not clear**, so
+on a deployment treat it as permanent until credentials are configured. Three
 things handle it, in order of how little they cost you:
 
-1. **An automatic client retry.** The default (web) client is the one that gets
-   challenged. `CLIENT_FALLBACKS` retries once with YouTube's `android` client,
-   which talks to a different endpoint and still serves a complete progressive
-   stream. Quality drops (typically 360p) — a working 360p beats nothing. Only
-   clients verified to finish a *download* belong in that list: `android_vr`,
-   for instance, extracts happily and then 403s on the media URLs, which is
-   worse than not trying. The whole chain is bounded by
-   `MEDIA_SITE_TIMEOUT_SECONDS`, since a challenged attempt burns wall clock on
-   its own retries.
-2. **Wait and retry.** Only the bot check is retried; a private video or an
+1. **An automatic client retry.** The default client is the one that gets
+   challenged. `CLIENT_FALLBACKS` retries with YouTube's `tv_embedded` client
+   and then `android`; each talks to a different endpoint, so one being
+   challenged says little about the next. `tv_embedded` returns the same streams
+   as the default, so nothing is lost; `android` drops to a lower-resolution
+   progressive stream — a working 360p beats nothing. Only clients verified to
+   finish a *download* belong in that list: `android_vr` and `tv` extract
+   happily and then fail on the media URLs, and `ios`, `mweb` and
+   `web_embedded` return only formats the selector cannot use. The whole chain
+   is bounded by `MEDIA_SITE_TIMEOUT_SECONDS`, since a challenged attempt burns
+   wall clock on its own retries.
+2. **Wait and retry.** Worth a try from a home connection; pointless from a
+   deployment. Only the bot check is retried at all — a private video or an
    over-long one fails on the first attempt, so the server does not hammer the
    site for no gain.
-3. **Cookies, if it will not let up.** Set `YOUTUBE_COOKIES_FILE` to a
-   `cookies.txt` export (Netscape format), or `YOUTUBE_COOKIES_FROM_BROWSER` to
-   a browser name. Both are unset by default: sending a logged-in session to a
+3. **Cookies — the only fix on a deployment.** Set `YOUTUBE_COOKIES_FILE` to a
+   `cookies.txt` export (Netscape format), `YOUTUBE_COOKIES` to that file's
+   *contents* where no file can be mounted, or `YOUTUBE_COOKIES_FROM_BROWSER` to
+   a browser name. All are unset by default: sending a logged-in session to a
    video site is the operator's decision, and those cookies are account
-   credentials — mount them as a secret, never bake them into the image.
+   credentials — set them as a secret, never bake them into the image or commit
+   them to `vercel.json`.
+
+   `YOUTUBE_COOKIES_FROM_BROWSER` cannot work in a container or on a serverless
+   host: there is no browser profile to read. Use `YOUTUBE_COOKIES_FILE` with a
+   mount, or `YOUTUBE_COOKIES` with the contents.
+
+   `/health` reports whether any of them took effect, as
+   `features.media_site_cookies`. When a challenge survives every player client,
+   the server log names the setting that is missing.
 
 If none of that suits, `ALLOW_MEDIA_SITE_URLS=false` takes the field off the
 page and leaves direct file links working. A video-site link then reports
@@ -355,9 +373,12 @@ through to the direct path and claiming the link is not a video file.
 #### Why moving hosts does not fix it
 
 The challenge is about the **IP**, not the platform. Moving from Vercel to Fly,
-Railway or Render changes nothing here — they are all datacenters. That is why
-`fly.toml`, `render.yaml` and `vercel.json` all set
-`ALLOW_MEDIA_SITE_URLS=false`, and a test asserts they still do.
+Railway or Render changes nothing here — they are all datacenters. `fly.toml`,
+`render.yaml` and `vercel.json` all set `ALLOW_MEDIA_SITE_URLS=true` and a test
+asserts they still do, on the understanding that the operator supplies
+`YOUTUBE_COOKIES`. Without it the field is on the page and every fetch is
+challenged, which is the worst of both — so set the credentials or turn the
+field off.
 
 Three ways to actually have it work on a server, none of them free:
 
@@ -450,8 +471,11 @@ returns the archive in one call, at the cost of the preview grid.
 
 Also worth knowing:
 
-- **Video-site links are off** (`ALLOW_MEDIA_SITE_URLS=false`). Not a Vercel
-  quirk: every cloud IP is a datacenter IP, and video sites challenge those.
+- **Video-site links are on but need credentials** (`ALLOW_MEDIA_SITE_URLS=true`).
+  Not a Vercel quirk: every cloud IP is a datacenter IP, and video sites
+  challenge those on every attempt. Set `YOUTUBE_COOKIES` in the project's
+  environment variables — a committed `vercel.json` is no place for account
+  credentials — or set `ALLOW_MEDIA_SITE_URLS=false` to take the field off.
 - **The invocation timeout binds.** 10 s on Hobby, 60 s on Pro — a large batch
   will exceed it long before the output limits do.
 
